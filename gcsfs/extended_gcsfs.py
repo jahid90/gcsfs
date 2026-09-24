@@ -31,7 +31,12 @@ from gcsfs import zb_hns_utils
 from gcsfs._dircache import HnsDirCacheUpdater
 from gcsfs.concurrency import split_range
 from gcsfs.core import GCSFile, GCSFileSystem, _get_prefetcher_and_cache_config
-from gcsfs.poller import _get_operation_name, _unwrap_operation_result
+from gcsfs.poller import (
+    DEFAULT_HNS_LRO_TIMEOUT,
+    _get_operation_name,
+    _unwrap_operation_result,
+    poll_lro,
+)
 from gcsfs.retry import DEFAULT_RETRY_CONFIG, get_storage_control_retry_config
 from gcsfs.zb_hns_utils import DirectMemmoveBuffer, MRDPool
 from gcsfs.zonal_file import ZonalFile
@@ -40,6 +45,15 @@ logger = logging.getLogger("gcsfs")
 
 USER_AGENT = "python-gcsfs"
 STORAGE_CONTROL_RPC_TIMEOUT = 30.0
+
+
+def _is_fast_poller_disabled() -> bool:
+    """Emergency rollback flag to bypass fast poller."""
+    return os.environ.get("GCSFS_DISABLE_FAST_LRO_POLLER", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
 
 class BucketType(Enum):
@@ -89,6 +103,8 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
     including zonal and hierarchical. For buckets without special properties, it forwards requests
     to the parent class GCSFileSystem for default processing.
     """
+
+    HNS_RENAME_FOLDER_LRO_TIMEOUT: float | None = DEFAULT_HNS_LRO_TIMEOUT
 
     def __init__(
         self,
@@ -827,12 +843,24 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                 f"HNS rename_folder dispatch failed for '{path1}' to '{path2}': {e}"
             ) from e
 
-        # Tier 2: Active LRO Wait
+        # Tier 2: Active LRO Polling & Rollback (LRO actively running on server)
         op_name = _get_operation_name(operation) or req_id
         start_time = time.monotonic()
 
         try:
-            await _unwrap_operation_result(operation)
+            if _is_fast_poller_disabled():
+                await _unwrap_operation_result(
+                    operation, timeout=self.HNS_RENAME_FOLDER_LRO_TIMEOUT
+                )
+            else:
+                await poll_lro(
+                    operation,
+                    timeout=self.HNS_RENAME_FOLDER_LRO_TIMEOUT,
+                    path1=effective_path1,
+                    path2=effective_path2,
+                    request_id=req_id,
+                    rpc_retry=self._get_retry_config(),
+                )
             self._update_dircache_after_rename(effective_path1, effective_path2)
             return
         except asyncio.CancelledError:

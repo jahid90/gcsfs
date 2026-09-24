@@ -11,6 +11,7 @@ in test_dircache.py, and zonal-specific filesystem routing belongs in
 test_zonal.py or test_zonal_file.py.
 """
 
+import asyncio
 import contextlib
 import os
 import uuid
@@ -679,6 +680,82 @@ class TestExtendedGcsFileSystemMv:
                 gcsfs.mv(path1, path2)
             mocks["super_mv"].assert_not_called()
             assert path1 not in gcsfs.dircache
+
+    def test_hns_rename_rollback_toggle_disables_fast_poller(
+        self, gcs_hns, gcs_hns_mocks, monkeypatch
+    ):
+        """Setting GCSFS_DISABLE_FAST_LRO_POLLER=1 bypasses poll_lro and awaits operation.result."""
+        gcsfs = gcs_hns
+        path1 = f"{TEST_HNS_BUCKET}/src_rollback"
+        path2 = f"{TEST_HNS_BUCKET}/dst_rollback"
+        monkeypatch.setenv("GCSFS_DISABLE_FAST_LRO_POLLER", "1")
+
+        with (
+            gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks,
+            mock.patch(
+                "gcsfs.extended_gcsfs.poll_lro", new_callable=mock.AsyncMock
+            ) as mock_poll_lro,
+        ):
+            mocks["info"].return_value = {"type": "directory", "name": path1}
+            gcsfs.mv(path1, path2)
+
+            mock_poll_lro.assert_not_called()
+            mocks[
+                "control_client"
+            ].rename_folder.return_value.result.assert_awaited_once()
+
+    def test_hns_rename_tier2_timeout_evicts_dircache(self, gcs_hns, gcs_hns_mocks):
+        """Timeout during Tier 2 active polling evicts dircache and raises OSError."""
+        gcsfs = gcs_hns
+        path1 = f"{TEST_HNS_BUCKET}/src_timeout"
+        path2 = f"{TEST_HNS_BUCKET}/dst_timeout"
+
+        with (
+            gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks,
+            mock.patch(
+                "gcsfs.extended_gcsfs.poll_lro",
+                new_callable=mock.AsyncMock,
+                side_effect=asyncio.TimeoutError("Polling timed out"),
+            ),
+        ):
+            mocks["info"].return_value = {"type": "directory", "name": path1}
+            gcsfs.dircache[path1] = [{"name": f"{path1}/f.txt", "type": "file"}]
+            gcsfs.dircache[f"{path1}/sub"] = [
+                {"name": f"{path1}/sub/g.txt", "type": "file"}
+            ]
+
+            with pytest.raises(OSError, match="HNS rename timed out"):
+                gcsfs.mv(path1, path2)
+
+            assert path1 not in gcsfs.dircache
+            assert f"{path1}/sub" not in gcsfs.dircache
+            mocks["super_mv"].assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_hns_rename_tier2_cancellation_evicts_dircache(
+        self, gcs_hns, gcs_hns_mocks
+    ):
+        """Cancellation during Tier 2 active polling evicts dircache and re-raises CancelledError."""
+        gcsfs = gcs_hns
+        path1 = f"{TEST_HNS_BUCKET}/src_cancel"
+        path2 = f"{TEST_HNS_BUCKET}/dst_cancel"
+
+        with (
+            gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks,
+            mock.patch(
+                "gcsfs.extended_gcsfs.poll_lro",
+                new_callable=mock.AsyncMock,
+                side_effect=asyncio.CancelledError(),
+            ),
+        ):
+            mocks["info"].return_value = {"type": "directory", "name": path1}
+            gcsfs.dircache[path1] = [{"name": f"{path1}/f.txt", "type": "file"}]
+
+            with pytest.raises(asyncio.CancelledError):
+                await gcsfs._mv(path1, path2)
+
+            assert path1 not in gcsfs.dircache
+            mocks["super_mv"].assert_not_called()
 
     def test_hns_rename_tier2_lro_error_unwraps_aborted_and_conflict(
         self, gcs_hns, gcs_hns_mocks
