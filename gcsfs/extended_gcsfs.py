@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import time
 import uuid
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -30,6 +31,7 @@ from gcsfs import zb_hns_utils
 from gcsfs._dircache import HnsDirCacheUpdater
 from gcsfs.concurrency import split_range
 from gcsfs.core import GCSFile, GCSFileSystem, _get_prefetcher_and_cache_config
+from gcsfs.poller import _get_operation_name, _unwrap_operation_result
 from gcsfs.retry import DEFAULT_RETRY_CONFIG, get_storage_control_retry_config
 from gcsfs.zb_hns_utils import DirectMemmoveBuffer, MRDPool
 from gcsfs.zonal_file import ZonalFile
@@ -669,6 +671,48 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
 
         return bucket_type in [BucketType.ZONAL_HIERARCHICAL, BucketType.HIERARCHICAL]
 
+    def _translate_rename_error(
+        self,
+        e: Exception,
+        path1: str,
+        path2: str,
+        op_id: str | None = None,
+        elapsed: float = 0.0,
+    ) -> Exception | None:
+        """Translates GAPIC and system exceptions into standard POSIX errors."""
+        op_info = f" [op: {op_id}, elapsed: {elapsed:.2f}s]" if op_id else ""
+
+        if isinstance(e, (FileNotFoundError, FileExistsError)):
+            return e
+
+        # Check Aborted BEFORE Conflict because Aborted is a subclass of Conflict
+        if isinstance(e, api_exceptions.Aborted):
+            return OSError(
+                f"HNS rename aborted due to concurrent lock contention: '{path1}' -> '{path2}'{op_info}"
+            )
+
+        if isinstance(e, (api_exceptions.Conflict, api_exceptions.AlreadyExists)):
+            return FileExistsError(
+                f"HNS rename failed due to conflict for '{path1}' to '{path2}'{op_info}"
+            )
+
+        if isinstance(e, api_exceptions.NotFound):
+            return FileNotFoundError(
+                f"Source '{path1}' not found for move operation.{op_info}"
+            )
+
+        if isinstance(
+            e, (api_exceptions.FailedPrecondition, api_exceptions.InvalidArgument)
+        ):
+            return OSError(f"HNS rename failed: {e}{op_info}")
+
+        if isinstance(e, (asyncio.TimeoutError, api_exceptions.DeadlineExceeded)):
+            return OSError(
+                f"HNS rename timed out after {elapsed:.2f}s for '{path1}' to '{path2}': {e}{op_info}"
+            )
+
+        return None
+
     async def _mv(self, path1, path2, **kwargs):
         """
         Move a file or directory. Overrides the parent `_mv` to provide an
@@ -693,71 +737,119 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         bucket1, key1, _ = self.split_path(path1)
         bucket2, key2, _ = self.split_path(path2)
 
-        is_hns = await self._is_bucket_hns_enabled(bucket1)
+        clean_key1 = key1.rstrip("/")
+        clean_key2 = key2.rstrip("/")
 
-        if not is_hns:
+        # Self-rename must be an immediate no-op to prevent destructive deletion
+        if bucket1 == bucket2 and clean_key1 == clean_key2:
+            logger.debug(
+                "Source and destination paths are identical ('%s'); skipping move.",
+                path1,
+            )
+            return
+
+        if not (clean_key1 and await self._is_bucket_hns_enabled(bucket1)):
             logger.debug(
                 f"Not an HNS bucket. Falling back to object-level mv for '{path1}' to '{path2}'."
             )
             return await super()._mv(path1, path2, **kwargs)
 
+        # Fail fast on non-existent source
         try:
             info1 = await self._info(path1)
-            is_folder = info1.get("type") == "directory"
-
-            # We only use HNS rename if the source is a folder and the move is
-            # within the same bucket.
-            if is_folder and bucket1 == bucket2 and key1:
-                logger.debug(
-                    f"Using HNS-aware folder rename for '{path1}' to '{path2}'."
-                )
-                source_folder_name = f"projects/_/buckets/{bucket1}/folders/{key1}"
-                destination_folder_id = key2 or key1.rstrip("/").split("/")[-1]
-
-                request = storage_control_v2.RenameFolderRequest(
-                    name=source_folder_name,
-                    destination_folder_id=destination_folder_id,
-                    request_id=str(uuid.uuid4()),
-                )
-
-                logger.debug(f"rename_folder request: {request}")
-                client = await self._get_control_plane_client()
-                operation = await client.rename_folder(
-                    request=request,
-                    retry=self._get_retry_config(),
-                    timeout=STORAGE_CONTROL_RPC_TIMEOUT,
-                )
-                await operation.result()
-                self._update_dircache_after_rename(path1, path2)
-
-                logger.debug(
-                    "Successfully renamed folder from '%s' to '%s'", path1, path2
-                )
-                return
-            elif not is_folder:
-                await self._mv_file(path1, path2)
-                return
+        except FileNotFoundError:
+            raise
+        except api_exceptions.NotFound as e:
+            raise FileNotFoundError(f"Source folder '{path1}' not found.") from e
         except Exception as e:
-            if isinstance(e, FileNotFoundError):
-                # If the source doesn't exist, fail fast.
-                raise
-            if isinstance(e, api_exceptions.NotFound):
-                raise FileNotFoundError(
-                    f"Source '{path1}' not found for move operation."
-                ) from e
-            if isinstance(e, api_exceptions.Conflict):
-                # This occurs if the destination folder already exists.
-                # Raise FileExistsError for fsspec compatibility.
-                raise FileExistsError(
-                    f"HNS rename failed due to conflict for '{path1}' to '{path2}'"
-                ) from e
-            if isinstance(e, api_exceptions.FailedPrecondition):
-                raise OSError(f"HNS rename failed: {e}") from e
+            logger.warning("Could not inspect HNS source path '%s': %s", path1, e)
+            if os.environ.get("GCSFS_ALLOW_UNSAFE_MV_FALLBACK", "0").lower() in (
+                "1",
+                "true",
+            ):
+                return await super()._mv(path1, path2, **kwargs)
+            raise
 
-            logger.warning(f"Could not perform HNS-aware mv: {e}")
+        is_folder = info1.get("type") == "directory"
+        if not is_folder:
+            await self._mv_file(path1, path2)
+            return
 
-        logger.debug(f"Falling back to object-level mv for '{path1}' to '{path2}'.")
-        return await super()._mv(path1, path2, **kwargs)
+        if bucket1 != bucket2:
+            logger.debug(f"Falling back to object-level mv for '{path1}' to '{path2}'.")
+            return await super()._mv(path1, path2, **kwargs)
+
+        # Support moving folder to bucket root
+        destination_folder_id = clean_key2 or clean_key1.split("/")[-1]
+        if clean_key1 == destination_folder_id:
+            return
+        effective_path1 = f"{bucket1}/{clean_key1}"
+        effective_path2 = f"{bucket2}/{destination_folder_id}"
+
+        logger.debug("Using HNS-aware folder rename for '%s' to '%s'.", path1, path2)
+        source_folder_name = f"projects/_/buckets/{bucket1}/folders/{clean_key1}"
+        req_id = str(uuid.uuid4())
+        request = storage_control_v2.RenameFolderRequest(
+            name=source_folder_name,
+            destination_folder_id=destination_folder_id,
+            request_id=req_id,
+        )
+        client = await self._get_control_plane_client()
+
+        # Tier 1: Initial RPC Dispatch (Pre-LRO Creation)
+        try:
+            operation = await client.rename_folder(
+                request=request,
+                retry=self._get_retry_config(),
+                timeout=STORAGE_CONTROL_RPC_TIMEOUT,
+            )
+        except (
+            api_exceptions.PermissionDenied,
+            api_exceptions.MethodNotImplemented,
+        ) as e:
+            logger.warning(
+                "Storage Control RenameFolder capability unavailable (%s); "
+                "falling back to object-level mv.",
+                e,
+            )
+            return await super()._mv(path1, path2, **kwargs)
+        except asyncio.CancelledError:
+            self._evict_failed_rename_cache(effective_path1, effective_path2)
+            raise
+        except Exception as e:
+            self._evict_failed_rename_cache(effective_path1, effective_path2)
+            translated = self._translate_rename_error(
+                e, effective_path1, effective_path2
+            )
+            if translated is not None:
+                raise translated from e
+            raise OSError(
+                f"HNS rename_folder dispatch failed for '{path1}' to '{path2}': {e}"
+            ) from e
+
+        # Tier 2: Active LRO Wait
+        op_name = _get_operation_name(operation) or req_id
+        start_time = time.monotonic()
+
+        try:
+            await _unwrap_operation_result(operation)
+            self._update_dircache_after_rename(effective_path1, effective_path2)
+            return
+        except asyncio.CancelledError:
+            self._evict_failed_rename_cache(effective_path1, effective_path2)
+            raise
+        except Exception as e:
+            elapsed = time.monotonic() - start_time
+            self._evict_failed_rename_cache(effective_path1, effective_path2)
+            translated = self._translate_rename_error(
+                e, effective_path1, effective_path2, op_id=op_name, elapsed=elapsed
+            )
+            if translated is not None:
+                raise translated from e
+            op_info = f" [op: {op_name}, elapsed: {elapsed:.2f}s]" if op_name else ""
+            raise OSError(
+                f"HNS folder rename operation failed during polling for '{path1}' to '{path2}': {e}{op_info}"
+            ) from e
 
     mv = asyn.sync_wrapper(_mv)
 

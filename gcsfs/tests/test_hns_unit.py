@@ -83,6 +83,7 @@ def gcs_hns_mocks():
 
         # Mock the async rename_folder method on the storage_control_client
         mock_rename_folder = mock.AsyncMock()
+        mock_rename_folder.return_value._operation.done = True
         mock_control_client_instance = mock.AsyncMock()
         mock_control_client_instance.list_folders = mock.AsyncMock()
         mock_control_client_instance.rename_folder = mock_rename_folder
@@ -614,6 +615,240 @@ class TestExtendedGcsFileSystemMv:
             mocks["super_mv"].assert_not_called()
             mocks["control_client"].rename_folder.assert_called()
 
+    def test_mv_same_normalized_path_with_trailing_slash_is_noop(
+        self, gcs_hns, gcs_hns_mocks
+    ):
+        """Self-rename differing only by trailing slash must be an immediate no-op."""
+        gcsfs = gcs_hns
+        path1 = f"{TEST_HNS_BUCKET}/some_dir/"
+        path2 = f"{TEST_HNS_BUCKET}/some_dir"
+
+        with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
+            gcsfs.mv(path1, path2)
+
+            mocks["async_lookup_bucket_type"].assert_not_called()
+            mocks["info"].assert_not_called()
+            mocks["control_client"].rename_folder.assert_not_called()
+            mocks["super_mv"].assert_not_called()
+
+    def test_hns_rename_aborted_maps_to_os_error_not_file_exists(
+        self, gcs_hns, gcs_hns_mocks
+    ):
+        """Aborted (409 subclass of Conflict) must raise retriable OSError, not FileExistsError."""
+        gcsfs = gcs_hns
+        path1 = f"{TEST_HNS_BUCKET}/src_dir"
+        path2 = f"{TEST_HNS_BUCKET}/dst_dir"
+
+        with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
+            mocks["info"].return_value = {"type": "directory"}
+            mocks["control_client"].rename_folder.side_effect = api_exceptions.Aborted(
+                "Lock contention"
+            )
+
+            with pytest.raises(
+                OSError, match="HNS rename aborted due to concurrent lock contention"
+            ) as exc_info:
+                gcsfs.mv(path1, path2)
+
+            assert not isinstance(exc_info.value, FileExistsError)
+            mocks["super_mv"].assert_not_called()
+
+    def test_hns_rename_tier1_allowlist_fallback_and_split_brain_defense(
+        self, gcs_hns, gcs_hns_mocks
+    ):
+        """PermissionDenied falls back to super_mv, whereas ambiguous DeadlineExceeded fails fast."""
+        gcsfs = gcs_hns
+        path1 = f"{TEST_HNS_BUCKET}/src_dir"
+        path2 = f"{TEST_HNS_BUCKET}/dst_dir"
+
+        with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
+            mocks["info"].return_value = {"type": "directory"}
+            mocks["control_client"].rename_folder.side_effect = (
+                api_exceptions.PermissionDenied("No storage control permission")
+            )
+            gcsfs.mv(path1, path2)
+            mocks["super_mv"].assert_awaited_once_with(path1, path2)
+
+        with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
+            mocks["info"].return_value = {"type": "directory"}
+            gcsfs.dircache[path1] = [{"name": f"{path1}/f.txt", "type": "file"}]
+            mocks["control_client"].rename_folder.side_effect = (
+                api_exceptions.DeadlineExceeded("Socket timeout")
+            )
+            with pytest.raises(OSError, match="HNS rename timed out"):
+                gcsfs.mv(path1, path2)
+            mocks["super_mv"].assert_not_called()
+            assert path1 not in gcsfs.dircache
+
+    def test_hns_rename_tier2_lro_error_unwraps_aborted_and_conflict(
+        self, gcs_hns, gcs_hns_mocks
+    ):
+        """Server-side LRO errors in Tier 2 unwrap integer status codes into typed POSIX errors."""
+        from types import SimpleNamespace
+
+        gcsfs = gcs_hns
+        path1 = f"{TEST_HNS_BUCKET}/src_tier2"
+        path2 = f"{TEST_HNS_BUCKET}/dst_tier2"
+
+        # 1. Server-side ABORTED (code 10) -> retriable OSError (not FileExistsError), evicts cache
+        with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
+            mocks["info"].return_value = {"type": "directory", "name": path1}
+            gcsfs.dircache[path1] = [{"name": f"{path1}/f.txt", "type": "file"}]
+            op = mocks["control_client"].rename_folder.return_value
+            op._operation.done = True
+            op.result.side_effect = api_exceptions.GoogleAPICallError(
+                "Spanner lock contention",
+                errors=[SimpleNamespace(code=10)],
+            )
+
+            with pytest.raises(
+                OSError, match="HNS rename aborted due to concurrent lock contention"
+            ) as exc_info:
+                gcsfs.mv(path1, path2)
+
+            assert not isinstance(exc_info.value, FileExistsError)
+            assert path1 not in gcsfs.dircache
+            mocks["super_mv"].assert_not_called()
+
+        # 2. Server-side ALREADY_EXISTS (code 6) -> FileExistsError, evicts cache
+        with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
+            mocks["info"].return_value = {"type": "directory", "name": path1}
+            gcsfs.dircache[path1] = [{"name": f"{path1}/f.txt", "type": "file"}]
+            op = mocks["control_client"].rename_folder.return_value
+            op._operation.done = True
+            op.result.side_effect = api_exceptions.GoogleAPICallError(
+                "Folder already exists",
+                errors=[SimpleNamespace(code=6)],
+            )
+
+            with pytest.raises(
+                FileExistsError, match="HNS rename failed due to conflict"
+            ):
+                gcsfs.mv(path1, path2)
+
+            assert path1 not in gcsfs.dircache
+            mocks["super_mv"].assert_not_called()
+
+        # 3. Server-side INVALID_ARGUMENT (code 3) -> OSError with op_id/elapsed telemetry, evicts cache
+        with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
+            mocks["info"].return_value = {"type": "directory", "name": path1}
+            gcsfs.dircache[path1] = [{"name": f"{path1}/f.txt", "type": "file"}]
+            op = mocks["control_client"].rename_folder.return_value
+            op._operation.done = True
+            op._operation.name = "projects/_/buckets/b/operations/op-inv-arg"
+            op.result.side_effect = api_exceptions.GoogleAPICallError(
+                "Invalid destination folder path",
+                errors=[SimpleNamespace(code=3)],
+            )
+
+            with pytest.raises(
+                OSError,
+                match=(
+                    r"HNS rename failed: .*Invalid destination folder path"
+                    r".*\[op: projects/_/buckets/b/operations/op-inv-arg, elapsed:"
+                ),
+            ):
+                gcsfs.mv(path1, path2)
+
+            assert path1 not in gcsfs.dircache
+            mocks["super_mv"].assert_not_called()
+
+    def test_hns_rename_info_error_handling_and_unsafe_fallback_flag(
+        self, gcs_hns, gcs_hns_mocks, monkeypatch
+    ):
+        """_info errors fail fast unless GCSFS_ALLOW_UNSAFE_MV_FALLBACK=1 is set."""
+        gcsfs = gcs_hns
+        path1 = f"{TEST_HNS_BUCKET}/src_info_err"
+        path2 = f"{TEST_HNS_BUCKET}/dst_info_err"
+
+        with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
+            mocks["info"].side_effect = api_exceptions.NotFound("Missing")
+            with pytest.raises(FileNotFoundError, match="Source folder"):
+                gcsfs.mv(path1, path2)
+            mocks["super_mv"].assert_not_called()
+
+        with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
+            mocks["info"].side_effect = RuntimeError("Transient info failure")
+            with pytest.raises(RuntimeError, match="Transient info failure"):
+                gcsfs.mv(path1, path2)
+            mocks["super_mv"].assert_not_called()
+
+            monkeypatch.setenv("GCSFS_ALLOW_UNSAFE_MV_FALLBACK", "1")
+            gcsfs.mv(path1, path2)
+            mocks["super_mv"].assert_awaited_once_with(path1, path2)
+
+    def test_hns_rename_source_with_trailing_slash_updates_and_evicts_dircache(
+        self, gcs_hns, gcs_hns_mocks
+    ):
+        """Source path with trailing slash must evict and update normalized dircache keys."""
+        gcsfs = gcs_hns
+        clean_src = f"{TEST_HNS_BUCKET}/old_dir"
+        slashed_src = f"{clean_src}/"
+        dst = f"{TEST_HNS_BUCKET}/new_dir"
+
+        with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
+            mocks["info"].return_value = {"type": "directory", "name": clean_src}
+            gcsfs.dircache[TEST_HNS_BUCKET] = [{"name": clean_src, "type": "directory"}]
+            gcsfs.dircache[clean_src] = [{"name": f"{clean_src}/f.txt", "type": "file"}]
+
+            gcsfs.mv(slashed_src, dst)
+
+            assert clean_src not in gcsfs.dircache
+            assert [e["name"] for e in gcsfs.dircache[TEST_HNS_BUCKET]] == [dst]
+
+        # Also verify error translation and cache eviction use effective_path1
+        with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
+            mocks["info"].return_value = {"type": "directory", "name": clean_src}
+            gcsfs.dircache[clean_src] = [{"name": f"{clean_src}/f.txt", "type": "file"}]
+            mocks["control_client"].rename_folder.side_effect = api_exceptions.Conflict(
+                "Folder conflict"
+            )
+
+            with pytest.raises(
+                FileExistsError,
+                match=f"HNS rename failed due to conflict for '{clean_src}' to '{dst}'",
+            ):
+                gcsfs.mv(slashed_src, dst)
+
+            assert clean_src not in gcsfs.dircache
+
+    def test_hns_rename_top_level_folder_to_bucket_root_is_noop(
+        self, gcs_hns, gcs_hns_mocks
+    ):
+        """Moving a top-level folder to bucket root ('b/dir1' -> 'b/') is a no-op after _info."""
+        gcsfs = gcs_hns
+        top_dir = f"{TEST_HNS_BUCKET}/dir1"
+        bucket_root = f"{TEST_HNS_BUCKET}/"
+
+        # 1. Top-level folder -> no-op after _info check
+        with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
+            mocks["info"].return_value = {"type": "directory", "name": top_dir}
+            gcsfs.mv(top_dir, bucket_root)
+            mocks["info"].assert_awaited_once_with(top_dir)
+            mocks["control_client"].rename_folder.assert_not_called()
+            mocks["super_mv"].assert_not_called()
+
+        # 2. Non-existent path -> still raises FileNotFoundError via _info
+        dne_path = f"{TEST_HNS_BUCKET}/dne"
+        with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
+            mocks["info"].side_effect = FileNotFoundError(dne_path)
+            with pytest.raises(FileNotFoundError):
+                gcsfs.mv(dne_path, bucket_root)
+            mocks["control_client"].rename_folder.assert_not_called()
+
+        # 3. File path -> still delegates to _mv_file
+        file_path = f"{TEST_HNS_BUCKET}/file.txt"
+        with (
+            gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks,
+            mock.patch.object(
+                gcsfs, "_mv_file", new_callable=mock.AsyncMock
+            ) as mock_mv_file,
+        ):
+            mocks["info"].return_value = {"type": "file", "name": file_path}
+            gcsfs.mv(file_path, bucket_root)
+            mock_mv_file.assert_awaited_once_with(file_path, bucket_root)
+            mocks["control_client"].rename_folder.assert_not_called()
+
 
 class TestExtendedGcsFileSystemMvFile:
     """Unit tests for the _mv_file method in ExtendedGcsFileSystem."""
@@ -1074,16 +1309,41 @@ class TestExtendedGcsFileSystemCacheHelpers:
             {"name": f"{src}/nested/new.txt", "type": "file"}
         ]
 
-        # Callers such as _mv pass the raw (protocol-qualified) paths through.
-        fs._update_dircache_after_rename(f"gs://{src}", f"gs://{dst}")
+        # Callers such as _mv pass the raw (protocol-qualified) paths through,
+        # potentially with trailing slashes.
+        fs._update_dircache_after_rename(f"gs://{src}/", f"gs://{dst}/")
 
         # Source and its descendants are dropped from the cache.
         assert src not in fs.dircache
         assert f"{src}/nested" not in fs.dircache
         # The source entry is removed from, and the stripped destination entry
-        # added to, the parent listing.
+        # added to, the parent listing without trailing slashes.
         names = [e["name"] for e in fs.dircache[TEST_HNS_BUCKET]]
         assert names == [dst]
+
+    def test_evict_failed_rename_cache_purges_subtrees_and_parents(self):
+        fs = ExtendedGcsFileSystem(token="anon", skip_instance_cache=True)
+        src = f"{TEST_HNS_BUCKET}/parent1/src"
+        dst = f"{TEST_HNS_BUCKET}/parent2/dst"
+        sibling = f"{TEST_HNS_BUCKET}/unrelated"
+
+        fs.dircache[f"{TEST_HNS_BUCKET}/parent1"] = [{"name": src, "type": "directory"}]
+        fs.dircache[f"{TEST_HNS_BUCKET}/parent2"] = [{"name": dst, "type": "directory"}]
+        fs.dircache[src] = [{"name": f"{src}/a.txt", "type": "file"}]
+        fs.dircache[f"{src}/sub"] = [{"name": f"{src}/sub/b.txt", "type": "file"}]
+        fs.dircache[dst] = [{"name": f"{dst}/c.txt", "type": "file"}]
+        fs.dircache[f"{dst}/sub"] = [{"name": f"{dst}/sub/d.txt", "type": "file"}]
+        fs.dircache[sibling] = [{"name": f"{sibling}/keep.txt", "type": "file"}]
+
+        fs._evict_failed_rename_cache(f"gs://{src}", f"gs://{dst}")
+
+        assert f"{TEST_HNS_BUCKET}/parent1" not in fs.dircache
+        assert f"{TEST_HNS_BUCKET}/parent2" not in fs.dircache
+        assert src not in fs.dircache
+        assert f"{src}/sub" not in fs.dircache
+        assert dst not in fs.dircache
+        assert f"{dst}/sub" not in fs.dircache
+        assert sibling in fs.dircache
 
 
 class TestExtendedGcsFileSystemMkdir:

@@ -146,11 +146,11 @@ class HnsDirCacheUpdater(DirCacheUpdater):
         # dircache keys and entry names are stored without the protocol, so
         # normalize the incoming paths first; otherwise the pop/startswith
         # matching below silently misses every cached entry for a ``gs://`` path.
-        path1 = self._strip_protocol(path1)
-        path2 = self._strip_protocol(path2)
+        path1 = self._strip_protocol(path1).rstrip("/")
+        path2 = self._strip_protocol(path2).rstrip("/")
 
         # 1. Find and remove all descendant paths of the source from the cache.
-        source_prefix = f"{path1.rstrip('/')}/"
+        source_prefix = f"{path1}/"
         for key in list(self.dircache):
             if key.startswith(source_prefix):
                 self.dircache.pop(key, None)
@@ -160,7 +160,7 @@ class HnsDirCacheUpdater(DirCacheUpdater):
         self._cache_drop_entries(self._parent(path1), {path1})
 
         # 3. Invalidate the destination path/subtree and update its parent's cache.
-        dest_prefix = f"{path2.rstrip('/')}/"
+        dest_prefix = f"{path2}/"
         for key in list(self.dircache):
             if key == path2 or key.startswith(dest_prefix):
                 self.dircache.pop(key, None)
@@ -168,6 +168,24 @@ class HnsDirCacheUpdater(DirCacheUpdater):
         self._cache_upsert_entry(
             self._parent(path2), self._directory_cache_entry(path2, key2)
         )
+
+    def _evict_failed_rename_cache(self, path1: str, path2: str) -> None:
+        """Evicts path1, path2, parents, and subtrees using single-pass prefix matching."""
+        p1 = self._strip_protocol(path1).strip("/")
+        p2 = self._strip_protocol(path2).strip("/")
+        targets = {p for p in (p1, p2) if p}
+        if not targets:
+            return
+        prefixes = tuple(f"{p}/" for p in targets)
+
+        for p in targets:
+            parent = self._parent(p)
+            if parent:
+                self.dircache.pop(parent, None)
+
+        evicted = [k for k in self.dircache if k in targets or k.startswith(prefixes)]
+        for key in evicted:
+            self.dircache.pop(key, None)
 
     async def _mv_file_cache_update(self, path1, path2, response=None):
         """
