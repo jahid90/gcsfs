@@ -1,5 +1,4 @@
 import asyncio
-import inspect
 import logging
 import math
 import random
@@ -415,9 +414,9 @@ async def poll_lro(
 
             async def _send_cancel() -> None:
                 try:
-                    maybe_coro = operation.cancel()
-                    if inspect.isawaitable(maybe_coro):
-                        await asyncio.wait_for(maybe_coro, timeout=PER_POLL_RPC_TIMEOUT)
+                    await asyncio.wait_for(
+                        operation.cancel(), timeout=PER_POLL_RPC_TIMEOUT
+                    )
                 except Exception as exc:
                     logger.debug(
                         "Failed to send LRO cancellation signal for %s: %s",
