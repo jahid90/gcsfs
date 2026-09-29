@@ -30,8 +30,6 @@ DEFAULT_LRO_JITTER_MAX: float = 1.25
 PER_POLL_RPC_TIMEOUT: float = 15.0
 #: Elapsed duration threshold in seconds above which completed LROs log at INFO instead of DEBUG.
 SLOW_LRO_LOG_THRESHOLD: float = 2.0
-#: Default outer timeout budget in seconds for HNS LRO operations (5 minutes).
-DEFAULT_HNS_LRO_TIMEOUT: float = 300.0
 
 
 @dataclass(frozen=True)
