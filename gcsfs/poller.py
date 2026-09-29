@@ -9,7 +9,9 @@ from typing import Any, Awaitable, Callable, Optional, Tuple, TypeVar
 from google.api_core import exceptions as api_exceptions
 
 logger = logging.getLogger("gcsfs")
+#: Generic return payload type for polled operations.
 T = TypeVar("T")
+#: Strong references to fire-and-forget background tasks to prevent premature garbage collection.
 _BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
 
 #: Linear growth rate of poll delay relative to elapsed time (5% of elapsed seconds).
@@ -226,7 +228,38 @@ async def poll_until(
     time_fn: Callable[[], float] = time.monotonic,
     sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> T:
-    """Polls an async check function until it reports completion or the schedule expires."""
+    """Polls an async check function until it reports completion or the schedule expires.
+
+    Args:
+        check_fn: Async callback accepting the current ``PollStatus`` and
+            returning a ``(is_done, result)`` tuple. Transient transport
+            exceptions (``ServiceUnavailable``, ``TooManyRequests``,
+            ``DeadlineExceeded``, ``InternalServerError``, and
+            ``asyncio.TimeoutError``) are caught and treated as ``(False, None)``.
+        schedule: ``PollSchedule`` (or callable) returning the delay in seconds
+            before the next attempt, or ``None`` to abort polling.
+        operation_id: Optional identifier included in debug and warning logs.
+        time_fn: Monotonic clock function returning current time in seconds.
+        sleep_fn: Async sleep function accepting a delay in seconds.
+
+    Returns:
+        The final payload ``T`` returned by ``check_fn`` when ``is_done`` is True.
+
+    Raises:
+        TypeError: If ``check_fn``, ``schedule``, ``time_fn``, or ``sleep_fn``
+            is not callable.
+        asyncio.TimeoutError: If ``schedule`` returns ``None`` before ``check_fn``
+            reports completion.
+    """
+    if not callable(check_fn):
+        raise TypeError("check_fn must be callable")
+    if not callable(schedule):
+        raise TypeError("schedule must be callable")
+    if not callable(time_fn):
+        raise TypeError("time_fn must be callable")
+    if not callable(sleep_fn):
+        raise TypeError("sleep_fn must be callable")
+
     start_time = time_fn()
     op_desc = f" for '{operation_id}'" if operation_id else ""
     logger.debug("Starting polling%s...", op_desc)
@@ -302,7 +335,21 @@ async def poll_until(
 async def _unwrap_operation_result(
     operation: Any, timeout: Optional[float] = None
 ) -> Any:
-    """Unpacks operation result or maps server-side error code to typed GoogleAPICallError."""
+    """Unpacks operation result or maps server-side error code to typed GoogleAPICallError.
+
+    Args:
+        operation: GAPIC ``AsyncOperation`` whose terminal result is ready to
+            be unpacked.
+        timeout: Optional timeout in seconds passed to ``operation.result()``.
+
+    Returns:
+        The unwrapped protobuf response payload returned by ``operation.result()``.
+
+    Raises:
+        google.api_core.exceptions.GoogleAPICallError: A specific subclass (mapped
+            via ``from_grpc_status`` when a raw ``GoogleAPICallError`` carries a
+            gRPC status code) or the original exception raised by the operation.
+    """
     try:
         return await operation.result(timeout=timeout)
     except api_exceptions.GoogleAPICallError as e:
@@ -323,7 +370,15 @@ async def _unwrap_operation_result(
 
 
 def _is_operation_already_done_in_memory(operation: Any) -> bool:
-    """Zero-RPC check inspecting underlying proto message for completion at t=0."""
+    """Zero-RPC check inspecting underlying proto message for completion at t=0.
+
+    Args:
+        operation: GAPIC ``AsyncOperation`` or wrapper object to inspect.
+
+    Returns:
+        ``True`` if the underlying protobuf message is present and already
+        marked ``done=True`` in memory; ``False`` otherwise.
+    """
     raw_op = getattr(operation, "_operation", None) or getattr(
         operation, "operation", None
     )
@@ -333,7 +388,14 @@ def _is_operation_already_done_in_memory(operation: Any) -> bool:
 
 
 def _get_operation_name(operation: Any) -> Optional[str]:
-    """Extracts the server-side operation name from a GAPIC AsyncOperation."""
+    """Extracts the server-side operation name from a GAPIC AsyncOperation.
+
+    Args:
+        operation: GAPIC ``AsyncOperation`` or wrapper object to inspect.
+
+    Returns:
+        The non-empty server-side operation name string if available, or ``None``.
+    """
     raw_op = getattr(operation, "_operation", None) or getattr(
         operation, "operation", None
     )
@@ -352,7 +414,44 @@ async def poll_lro(
     time_fn: Callable[[], float] = time.monotonic,
     sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> Any:
-    """Awaits completion of a GAPIC AsyncOperation using a low-lag PollSchedule."""
+    """Awaits completion of a GAPIC AsyncOperation using a low-lag PollSchedule.
+
+    Args:
+        operation: GAPIC ``AsyncOperation`` returned by Storage Control gRPC APIs.
+        schedule: Optional custom ``PollSchedule``. Defaults to
+            ``get_default_hns_lro_cadence()`` when ``None``.
+        timeout: Optional overall timeout budget in seconds. When provided, wraps
+            the active schedule with ``.max_duration(timeout)``.
+        path1: Optional source path for diagnostic logging context.
+        path2: Optional destination path for diagnostic logging context.
+        request_id: Optional fallback identifier used in logs when the operation
+            does not expose a server-side name.
+        rpc_retry: Optional ``AsyncRetry`` policy clamped to a short per-poll
+            window and forwarded to ``operation.done()``.
+        time_fn: Monotonic clock function returning current time in seconds.
+        sleep_fn: Async sleep function accepting a delay in seconds.
+
+    Returns:
+        The unwrapped operation result returned by ``operation.result()``.
+
+    Raises:
+        TypeError: If ``schedule`` (when not ``None``), ``time_fn``, or
+            ``sleep_fn`` is not callable.
+        ValueError: If ``timeout`` is not a positive finite number.
+        asyncio.TimeoutError: If the operation does not complete before the
+            polling schedule or ``timeout`` expires.
+        asyncio.CancelledError: If the polling task is cancelled (after
+            dispatching a best-effort background ``operation.cancel()`` task).
+        google.api_core.exceptions.GoogleAPICallError: If the server-side
+            operation terminates with an error.
+    """
+    if schedule is not None and not callable(schedule):
+        raise TypeError("schedule must be callable")
+    if not callable(time_fn):
+        raise TypeError("time_fn must be callable")
+    if not callable(sleep_fn):
+        raise TypeError("sleep_fn must be callable")
+
     op_name = _get_operation_name(operation)
     op_id = op_name if op_name else (request_id or "LRO")
     path_ctx = f"'{path1}' -> '{path2}'" if path1 and path2 else op_id

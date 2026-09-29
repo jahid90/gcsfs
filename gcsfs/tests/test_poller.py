@@ -343,3 +343,67 @@ class TestPollLroAndRunners:
 
         await asyncio.gather(*list(_BACKGROUND_TASKS), return_exceptions=True)
         operation.cancel.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "override_kwarg, match_msg",
+        [
+            ({"check_fn": "not_callable"}, "check_fn must be callable"),
+            ({"schedule": "not_callable"}, "schedule must be callable"),
+            ({"time_fn": "not_callable"}, "time_fn must be callable"),
+            ({"sleep_fn": "not_callable"}, "sleep_fn must be callable"),
+        ],
+    )
+    async def test_poll_until_rejects_non_callable_arguments(
+        self, override_kwarg, match_msg
+    ):
+        clock = FakeVirtualClock()
+
+        async def valid_check(status: PollStatus):
+            return True, "ok"
+
+        kwargs = {
+            "check_fn": valid_check,
+            "schedule": PollSchedule.linear_elapsed(0.05).floor(0.200),
+            "time_fn": clock.time,
+            "sleep_fn": clock.sleep,
+        }
+        kwargs.update(override_kwarg)
+
+        with pytest.raises(TypeError, match=match_msg):
+            await poll_until(**kwargs)  # type: ignore[arg-type]
+
+        assert clock.sleeps == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "override_kwarg, match_msg",
+        [
+            ({"schedule": "not_callable"}, "schedule must be callable"),
+            ({"time_fn": "not_callable"}, "time_fn must be callable"),
+            ({"sleep_fn": "not_callable"}, "sleep_fn must be callable"),
+        ],
+    )
+    async def test_poll_lro_rejects_non_callable_arguments(
+        self, override_kwarg, match_msg
+    ):
+        clock = FakeVirtualClock()
+        operation = mock.AsyncMock()
+        operation._operation = SimpleNamespace(
+            done=True, name="projects/_/buckets/b/operations/op-invalid-arg"
+        )
+
+        kwargs = {
+            "operation": operation,
+            "schedule": PollSchedule.linear_elapsed(0.05).floor(0.200),
+            "time_fn": clock.time,
+            "sleep_fn": clock.sleep,
+        }
+        kwargs.update(override_kwarg)
+
+        with pytest.raises(TypeError, match=match_msg):
+            await poll_lro(**kwargs)  # type: ignore[arg-type]
+
+        operation.done.assert_not_called()
+        operation.result.assert_not_called()
+        assert clock.sleeps == []
