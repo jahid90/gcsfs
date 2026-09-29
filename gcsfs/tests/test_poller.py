@@ -531,3 +531,24 @@ class TestPollLroAndRunners:
         operation.done.assert_not_called()
         operation.result.assert_not_called()
         assert clock.sleeps == []
+
+    @pytest.mark.asyncio
+    async def test_poll_lro_accepts_plain_callable_schedule_with_timeout(self):
+        clock = FakeVirtualClock()
+        operation = mock.AsyncMock()
+        operation._operation = SimpleNamespace(
+            done=False, name="projects/_/buckets/b/operations/op-callable-sched"
+        )
+        operation.done.side_effect = [False, True]
+        operation.result.return_value = "done_with_plain_callable"
+
+        res = await poll_lro(
+            operation,
+            schedule=lambda s: 0.2,  # type: ignore[arg-type]
+            timeout=10.0,
+            time_fn=clock.time,
+            sleep_fn=clock.sleep,
+        )
+
+        assert res == "done_with_plain_callable"
+        assert clock.sleeps == [pytest.approx(0.2), pytest.approx(0.2)]

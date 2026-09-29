@@ -300,12 +300,19 @@ async def poll_until(
 ) -> T:
     """Polls an async check function until it reports completion or the schedule expires.
 
+    This runner follows a sleep-then-check cadence on every iteration. Callers
+    that can satisfy completion synchronously at ``t=0`` (for example,
+    ``poll_lro``'s in-memory ``_is_operation_already_done_in_memory`` pre-check)
+    should perform that initial check before invoking ``poll_until``, or else
+    incur the overhead of the first scheduled sleep.
+
     Args:
         check_fn: Async callback accepting the current ``PollStatus`` and
             returning a ``(is_done, result)`` tuple. Transient transport
             exceptions (``ServiceUnavailable``, ``TooManyRequests``,
             ``DeadlineExceeded``, ``InternalServerError``, ``BadGateway``, and
-            ``asyncio.TimeoutError``) are caught and treated as ``(False, None)``.
+            ``asyncio.TimeoutError``) are caught and retried on the next
+            scheduled attempt.
         schedule: ``PollSchedule`` (or callable) returning the delay in seconds
             before the next attempt, or ``None`` to abort polling.
         operation_id: Optional identifier included in debug and warning logs.
@@ -331,6 +338,8 @@ async def poll_until(
 
     attempts = 1
 
+    # Sleep before each status check; callers should perform any t=0 pre-check
+    # prior to calling poll_until to avoid an immediate redundant network RPC.
     while True:
         now = time_fn()
         elapsed = now - start_time
@@ -526,7 +535,12 @@ async def poll_lro(
         )
         return await _unwrap_operation_result(operation)
 
-    base_schedule = schedule if schedule is not None else get_default_hns_lro_cadence()
+    if schedule is not None:
+        base_schedule = (
+            schedule if isinstance(schedule, PollSchedule) else PollSchedule(schedule)
+        )
+    else:
+        base_schedule = get_default_hns_lro_cadence()
     active_schedule = (
         base_schedule.max_duration(timeout) if timeout is not None else base_schedule
     )
