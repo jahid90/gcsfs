@@ -363,6 +363,21 @@ async def poll_until(
 
         try:
             is_done, result = await check_fn(status)
+            if is_done:
+                final_elapsed = time_fn() - start_time
+                log_level = (
+                    logging.INFO
+                    if final_elapsed >= SLOW_LRO_LOG_THRESHOLD
+                    else logging.DEBUG
+                )
+                logger.log(
+                    log_level,
+                    "Polling completed%s in %.3fs across %d attempts.",
+                    op_desc,
+                    final_elapsed,
+                    attempts,
+                )
+                return result
         except _TRANSIENT_POLL_EXCEPTIONS as e:
             logger.debug(
                 "Transient transport error during status check #%d%s: %s",
@@ -370,23 +385,6 @@ async def poll_until(
                 op_desc,
                 e,
             )
-            is_done, result = False, None
-
-        if is_done:
-            final_elapsed = time_fn() - start_time
-            log_level = (
-                logging.INFO
-                if final_elapsed >= SLOW_LRO_LOG_THRESHOLD
-                else logging.DEBUG
-            )
-            logger.log(
-                log_level,
-                "Polling completed%s in %.3fs across %d attempts.",
-                op_desc,
-                final_elapsed,
-                attempts,
-            )
-            return result
 
         attempts += 1
 
@@ -451,7 +449,10 @@ def _is_operation_already_done_in_memory(operation: Any) -> bool:
         ``True`` if the underlying protobuf message is present and already
         marked ``done=True`` in memory; ``False`` otherwise.
     """
-    return getattr(_raw_operation_pb(operation), "done", False) is True
+    return (
+        getattr(_raw_operation_pb(operation), "done", False) is True
+        or getattr(operation, "done", False) is True
+    )
 
 
 def _get_operation_name(operation: Any) -> Optional[str]:
