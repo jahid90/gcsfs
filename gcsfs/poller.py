@@ -449,10 +449,7 @@ def _is_operation_already_done_in_memory(operation: Any) -> bool:
         ``True`` if the underlying protobuf message is present and already
         marked ``done=True`` in memory; ``False`` otherwise.
     """
-    return (
-        getattr(_raw_operation_pb(operation), "done", False) is True
-        or getattr(operation, "done", False) is True
-    )
+    return getattr(_raw_operation_pb(operation), "done", False) is True
 
 
 def _get_operation_name(operation: Any) -> Optional[str]:
