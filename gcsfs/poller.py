@@ -18,7 +18,7 @@ T = TypeVar("T")
 _BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
 
 #: Linear growth rate of poll delay relative to elapsed time (5% of elapsed seconds).
-DEFAULT_LRO_POLL_SLOPE: float = 0.05
+DEFAULT_LRO_POLL_SLOPE: float = 0.15
 #: Default minimum delay between polling attempts in seconds (200 ms).
 DEFAULT_LRO_POLL_FLOOR: float = 0.200
 #: Hard minimum safety floor in seconds (50 ms) to prevent busy-looping or DoS-ing the server.
