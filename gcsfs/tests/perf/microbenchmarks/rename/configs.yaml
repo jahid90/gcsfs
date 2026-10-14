@@ -21,3 +21,24 @@ scenarios:
   - name: "rename_files"
     folders: [10]
     files: [100]
+
+  # Bench-only scenarios for comparing LRO poll cadences on HNS buckets.
+  # Run with _BUCKET_TYPES=hns. files >= folders so every folder holds at
+  # least one object (folders are implied by object paths).
+  - name: "rename_flat_1k"
+    folders: [1024]
+    files: [65536]
+
+  - name: "rename_recursive_1k"
+    depth: 8
+    folders: [1024]
+    files: [65536]
+
+  - name: "rename_flat_4k"
+    folders: [4096]
+    files: [131072]
+
+  - name: "rename_recursive_4k"
+    depth: 8
+    folders: [4096]
+    files: [131072]
