@@ -737,3 +737,77 @@ def publish_multi_process_benchmark_extra_info(
     benchmark.extra_info["mean_run"] = mean_time
     benchmark.extra_info["median_run"] = median_time
     benchmark.extra_info["stddev_run"] = stddev_time
+
+
+# --- Benchmark-only tracing (not for merge) ---------------------------------
+# The Cloud Build runner calls pytest with ``log_cli_level=INFO``, so DEBUG
+# records never reach the build log. The handler below re-emits the
+# ``google.api_core.retry`` DEBUG records (one ``Retrying due to ...`` line per
+# unfinished poll in ``AsyncOperation.result()``) at INFO on a separate logger,
+# with the record's UTC creation time. Library code is not changed.
+
+_BENCHTRACE = logging.getLogger("benchtrace")
+
+
+def _benchtrace_utc(created=None):
+    import datetime
+
+    if created is None:
+        created = time.time()
+    return datetime.datetime.fromtimestamp(created, datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S.%fZ"
+    )
+
+
+class _ApiCoreRetryForwarder(logging.Handler):
+    def emit(self, record):
+        try:
+            _BENCHTRACE.info(
+                "BENCHTRACE api_core_retry ts=%s level=%s msg=%s",
+                _benchtrace_utc(record.created),
+                record.levelname,
+                record.getMessage(),
+            )
+        except Exception:
+            self.handleError(record)
+
+
+_api_core_retry_logger = logging.getLogger("google.api_core.retry")
+_api_core_retry_logger.setLevel(logging.DEBUG)
+if not any(
+    isinstance(h, _ApiCoreRetryForwarder) for h in _api_core_retry_logger.handlers
+):
+    _api_core_retry_logger.addHandler(_ApiCoreRetryForwarder(logging.DEBUG))
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _benchtrace_versions():
+    import sys
+    from importlib import metadata
+
+    for dist in (
+        "google-api-core",
+        "google-cloud-storage",
+        "google-cloud-storage-control",
+        "grpcio",
+        "google-auth",
+        "gcsfs",
+    ):
+        try:
+            version = metadata.version(dist)
+        except metadata.PackageNotFoundError:
+            version = "not-installed"
+        _BENCHTRACE.info("BENCHTRACE version %s=%s", dist, version)
+    _BENCHTRACE.info("BENCHTRACE version python=%s", sys.version.split()[0])
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _benchtrace_case_boundaries(request):
+    _BENCHTRACE.info(
+        "BENCHTRACE case-start ts=%s id=%s", _benchtrace_utc(), request.node.name
+    )
+    yield
+    _BENCHTRACE.info(
+        "BENCHTRACE case-end ts=%s id=%s", _benchtrace_utc(), request.node.name
+    )
