@@ -1096,14 +1096,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         return bucket_type in [BucketType.ZONAL_HIERARCHICAL, BucketType.HIERARCHICAL]
 
     async def _wait_for_folder_rename(self, operation, path1, path2, request_id):
-        """Waits for a RenameFolder operation to finish.
-
-        Polls with ``poll_lro`` for at most ``HNS_RENAME_FOLDER_LRO_TIMEOUT`` seconds.
-
-        Raises:
-            TimeoutError: If polling times out. The server-side rename is not
-                cancelled and may still complete.
-        """
+        """Waits for a RenameFolder operation with poll_lro; raises TimeoutError on timeout."""
         try:
             await poll_lro(operation, timeout=HNS_RENAME_FOLDER_LRO_TIMEOUT)
         except asyncio.TimeoutError as e:
