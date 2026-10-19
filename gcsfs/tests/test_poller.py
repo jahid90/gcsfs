@@ -11,9 +11,9 @@ from google.rpc import code_pb2, status_pb2
 from gcsfs.poller import (
     _BACKGROUND_TASKS,
     _calculate_poll_delay,
-    _unwrap_operation_result,
     poll_lro,
     poll_until,
+    unwrap_operation_result,
 )
 from gcsfs.tests.lro_fakes import FakeLroFactory, operation_pb
 
@@ -76,7 +76,7 @@ class TestCalculatePollDelay:
 
 
 class TestPollRunners:
-    """Virtual-time unit tests for poll_until, _unwrap_operation_result, and poll_lro."""
+    """Virtual-time unit tests for poll_until, unwrap_operation_result, and poll_lro."""
 
     @pytest.mark.asyncio
     async def test_zero_rpc_in_memory_check_completes_at_t0(self, fake_lro):
@@ -406,7 +406,7 @@ class TestPollRunners:
         operation.result.side_effect = raw_err
 
         with pytest.raises(expected_cls):
-            await _unwrap_operation_result(operation)
+            await unwrap_operation_result(operation)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -420,7 +420,7 @@ class TestPollRunners:
         operation.result.side_effect = raw_err
 
         with pytest.raises(api_exceptions.GoogleAPICallError) as exc_info:
-            await _unwrap_operation_result(operation)
+            await unwrap_operation_result(operation)
 
         assert exc_info.value is raw_err
 

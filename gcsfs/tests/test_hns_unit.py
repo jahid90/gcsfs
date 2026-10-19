@@ -1056,21 +1056,48 @@ class TestExtendedGcsFileSystemMv:
             assert [e["name"] for e in gcsfs.dircache[TEST_HNS_BUCKET]] == [path2]
 
     @pytest.mark.parametrize(
-        "code",
-        [code_pb2.ALREADY_EXISTS, code_pb2.INTERNAL],
-        ids=["already_exists", "internal"],
+        "code, expected_exc",
+        [
+            (code_pb2.ALREADY_EXISTS, FileExistsError),
+            (code_pb2.NOT_FOUND, FileNotFoundError),
+        ],
+        ids=["already_exists", "not_found"],
     )
-    def test_hns_rename_with_fast_lro_polling_off_matches_operation_result(
-        self, gcs_hns, gcs_hns_mocks, fake_lro, code
+    def test_hns_rename_with_fast_lro_polling_off_maps_operation_errors(
+        self, gcs_hns, gcs_hns_mocks, fake_lro, code, expected_exc
     ):
-        """With polling off, a failed operation surfaces as api-core's
-        operation.result() raises it: a bare GoogleAPICallError, which the
-        rename error mappings don't match. The operation finished with an
-        error, so the cache is dropped and mv falls back to object-level mv."""
+        """With polling off, operation errors are still typed and mapped, so
+        they raise without falling back and drop the cached listings."""
         gcsfs = gcs_hns
         path1 = f"{TEST_HNS_BUCKET}/src_dir"
         path2 = f"{TEST_HNS_BUCKET}/dst_dir"
         lro = fake_lro.failed(code, after=1)
+
+        with (
+            gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks,
+            mock.patch.object(gcsfs, "fast_lro_polling", False),
+        ):
+            mocks["info"].return_value = {"type": "directory", "name": path1}
+            mocks["control_client"].rename_folder.return_value = lro.op
+            gcsfs.dircache[path1] = [{"name": f"{path1}/f.txt", "type": "file"}]
+            gcsfs.dircache[path2] = [{"name": f"{path2}/g.txt", "type": "file"}]
+
+            with pytest.raises(expected_exc):
+                gcsfs.mv(path1, path2)
+
+            mocks["super_mv"].assert_not_called()
+            assert path1 not in gcsfs.dircache
+            assert path2 not in gcsfs.dircache
+
+    def test_hns_rename_with_fast_lro_polling_off_falls_back_on_unmapped_error(
+        self, gcs_hns, gcs_hns_mocks, fake_lro
+    ):
+        """With polling off, an operation that finished with an unmapped error
+        still falls back to object-level mv, as with polling on."""
+        gcsfs = gcs_hns
+        path1 = f"{TEST_HNS_BUCKET}/src_dir"
+        path2 = f"{TEST_HNS_BUCKET}/dst_dir"
+        lro = fake_lro.failed(code_pb2.INTERNAL, after=1)
 
         with (
             gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks,

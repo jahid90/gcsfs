@@ -163,8 +163,14 @@ async def poll_until(
         attempts += 1
 
 
-async def _unwrap_operation_result(operation: AsyncOperation) -> Any:
-    """Returns the operation result, raising a typed error for a failed operation."""
+async def unwrap_operation_result(operation: AsyncOperation) -> Any:
+    """Awaits ``operation.result()``, raising a typed error if the operation failed.
+
+    Raises:
+        google.api_core.exceptions.GoogleAPICallError: The subclass for the
+            operation's error code (for example ``NotFound``), or the original
+            error if it has no int code.
+    """
     try:
         return await operation.result()
     except api_exceptions.GoogleAPICallError as e:
@@ -237,7 +243,7 @@ async def poll_lro(
             "LRO %s completed synchronously in memory at t=0; skipping polling.",
             op_id,
         )
-        return await _unwrap_operation_result(operation)
+        return await unwrap_operation_result(operation)
 
     start_time = time_fn()
 
@@ -295,4 +301,4 @@ async def poll_lro(
         cancel_task.add_done_callback(_BACKGROUND_TASKS.discard)
         raise
 
-    return await _unwrap_operation_result(operation)
+    return await unwrap_operation_result(operation)

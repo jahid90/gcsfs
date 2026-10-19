@@ -38,7 +38,7 @@ from gcsfs.core import (
     _location,
     _resolve_generation_match,
 )
-from gcsfs.poller import poll_lro
+from gcsfs.poller import poll_lro, unwrap_operation_result
 from gcsfs.retry import DEFAULT_RETRY_CONFIG, get_storage_control_retry_config
 from gcsfs.zb_hns_utils import MRD_MAX_RANGES, DirectMemmoveBuffer, MRDPool
 from gcsfs.zonal_file import ZonalFile
@@ -1181,7 +1181,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                             operation, path1, path2, request.request_id
                         )
                     else:
-                        await operation.result()
+                        await unwrap_operation_result(operation)
                     self._update_dircache_after_rename(path1, path2)
                 except BaseException as e:
                     # The rename may still be running or may already have
