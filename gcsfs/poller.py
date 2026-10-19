@@ -398,15 +398,12 @@ async def poll_until(
         attempts += 1
 
 
-async def _unwrap_operation_result(
-    operation: AsyncOperation, timeout: Optional[float] = None
-) -> Any:
+async def _unwrap_operation_result(operation: AsyncOperation) -> Any:
     """Unpacks operation result or maps server-side error code to typed GoogleAPICallError.
 
     Args:
         operation: GAPIC ``AsyncOperation`` whose terminal result is ready to
             be unpacked.
-        timeout: Optional timeout in seconds passed to ``operation.result()``.
 
     Returns:
         The unwrapped protobuf response payload returned by ``operation.result()``.
@@ -417,7 +414,7 @@ async def _unwrap_operation_result(
             gRPC status code) or the original exception raised by the operation.
     """
     try:
-        return await operation.result(timeout=timeout)
+        return await operation.result()
     except api_exceptions.GoogleAPICallError as e:
         if type(e) is api_exceptions.GoogleAPICallError and e.errors:
             raise api_exceptions.from_grpc_status(
