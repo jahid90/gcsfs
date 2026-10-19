@@ -38,7 +38,7 @@ from gcsfs.core import (
     _location,
     _resolve_generation_match,
 )
-from gcsfs.poller import DEFAULT_HNS_LRO_TIMEOUT, poll_lro
+from gcsfs.poller import poll_lro
 from gcsfs.retry import DEFAULT_RETRY_CONFIG, get_storage_control_retry_config
 from gcsfs.zb_hns_utils import MRD_MAX_RANGES, DirectMemmoveBuffer, MRDPool
 from gcsfs.zonal_file import ZonalFile
@@ -47,6 +47,7 @@ logger = logging.getLogger("gcsfs")
 
 USER_AGENT = "python-gcsfs"
 STORAGE_CONTROL_RPC_TIMEOUT = 30.0
+HNS_RENAME_FOLDER_LRO_TIMEOUT = 300.0
 
 
 class BucketType(Enum):
@@ -1075,7 +1076,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
     async def _wait_for_folder_rename(self, operation, path1, path2, request_id):
         """Waits for a RenameFolder operation to finish.
 
-        Polls with ``poll_lro`` for at most ``DEFAULT_HNS_LRO_TIMEOUT`` seconds.
+        Polls with ``poll_lro`` for at most ``HNS_RENAME_FOLDER_LRO_TIMEOUT`` seconds.
 
         Raises:
             TimeoutError: If polling times out. The server-side rename is not
@@ -1084,7 +1085,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         try:
             await poll_lro(
                 operation,
-                timeout=DEFAULT_HNS_LRO_TIMEOUT,
+                timeout=HNS_RENAME_FOLDER_LRO_TIMEOUT,
                 path1=path1,
                 path2=path2,
                 request_id=request_id,
@@ -1093,7 +1094,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             op_name = operation.operation.name or request_id
             raise TimeoutError(
                 f"HNS folder rename from '{path1}' to '{path2}' (op: {op_name}) "
-                f"did not finish within {DEFAULT_HNS_LRO_TIMEOUT:g}s. The rename "
+                f"did not finish within {HNS_RENAME_FOLDER_LRO_TIMEOUT:g}s. The rename "
                 "may still complete on the server; check the destination before "
                 "retrying."
             ) from e

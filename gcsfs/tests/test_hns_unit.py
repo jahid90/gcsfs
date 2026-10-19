@@ -650,7 +650,7 @@ class TestExtendedGcsFileSystemMv:
     def test_hns_rename_waits_with_poll_lro_and_default_timeout(
         self, gcs_hns, gcs_hns_mocks
     ):
-        """The rename waits with poll_lro, bounded by DEFAULT_HNS_LRO_TIMEOUT,
+        """The rename waits with poll_lro, bounded by HNS_RENAME_FOLDER_LRO_TIMEOUT,
         instead of operation.result()."""
         gcsfs = gcs_hns
         path1 = f"{TEST_HNS_BUCKET}/src_dir"
@@ -689,7 +689,7 @@ class TestExtendedGcsFileSystemMv:
             "gcsfs.poller.get_default_hns_lro_cadence",
             lambda: PollSchedule(lambda status: 0.05),
         )
-        monkeypatch.setattr("gcsfs.extended_gcsfs.DEFAULT_HNS_LRO_TIMEOUT", 0.2)
+        monkeypatch.setattr("gcsfs.extended_gcsfs.HNS_RENAME_FOLDER_LRO_TIMEOUT", 0.2)
         lro = fake_lro.pending(name=name)
 
         with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
