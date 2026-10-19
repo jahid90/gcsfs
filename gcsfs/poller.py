@@ -166,6 +166,9 @@ async def poll_until(
 async def unwrap_operation_result(operation: AsyncOperation) -> Any:
     """Awaits ``operation.result()``, raising a typed error if the operation failed.
 
+    Args:
+        operation: The operation to wait for.
+
     Raises:
         google.api_core.exceptions.GoogleAPICallError: The subclass for the
             operation's error code (for example ``NotFound``), or the original
