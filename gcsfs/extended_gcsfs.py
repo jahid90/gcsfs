@@ -50,6 +50,21 @@ STORAGE_CONTROL_RPC_TIMEOUT = 30.0
 HNS_RENAME_FOLDER_LRO_TIMEOUT = 300.0
 
 
+def _parse_bool(value, name):
+    """Returns ``value`` as a bool, accepting the strings fsspec config can pass."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("1", "true", "yes", "on"):
+            return True
+        if lowered in ("0", "false", "no", "off"):
+            return False
+    raise ValueError(f"{name} must be a boolean, got {value!r}")
+
+
 class BucketType(Enum):
     ZONAL_HIERARCHICAL = "ZONAL_HIERARCHICAL"
     HIERARCHICAL = "HIERARCHICAL"
@@ -125,6 +140,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         finalize_on_close=False,
         mrd_pool_cache_size=16,
         max_mrd_pool_cache_queue_size=16,
+        fast_lro_polling=True,
         **kwargs,
     ):
         """
@@ -136,6 +152,11 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             Maximum number of idle pools to retain in the cache.
         max_mrd_pool_cache_queue_size : int, default 16
             Maximum number of idle MRDs per key in the cache.
+        fast_lro_polling : bool, default True
+            Wait for HNS folder renames with gcsfs's own poller, which checks
+            often early on and gives up after a timeout. Set to False (or set
+            ``FSSPEC_GCS_FAST_LRO_POLLING=false``) to wait with
+            ``operation.result()`` from google-api-core instead.
         **kwargs : dict
             Additional arguments passed to GCSFileSystem.
             Supports retry configuration overrides for Storage Control API:
@@ -145,6 +166,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             - retry_multiplier: Multiplier for delay between retries.
             These map to `google.api_core.retry.AsyncRetry` arguments (without 'retry_' prefix).
         """
+        self.fast_lro_polling = _parse_bool(fast_lro_polling, "fast_lro_polling")
         valid_keys = DEFAULT_RETRY_CONFIG.keys()
         self.retry_config = {
             k[6:]: v
@@ -1154,9 +1176,12 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                 )
                 rename_submitted = True
                 try:
-                    await self._wait_for_folder_rename(
-                        operation, path1, path2, request.request_id
-                    )
+                    if self.fast_lro_polling:
+                        await self._wait_for_folder_rename(
+                            operation, path1, path2, request.request_id
+                        )
+                    else:
+                        await operation.result()
                     self._update_dircache_after_rename(path1, path2)
                 except BaseException as e:
                     # The rename may still be running or may already have
