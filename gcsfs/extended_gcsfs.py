@@ -38,7 +38,7 @@ from gcsfs.core import (
     _location,
     _resolve_generation_match,
 )
-from gcsfs.poller import DEFAULT_HNS_LRO_TIMEOUT, _get_operation_name, poll_lro
+from gcsfs.poller import DEFAULT_HNS_LRO_TIMEOUT, poll_lro
 from gcsfs.retry import DEFAULT_RETRY_CONFIG, get_storage_control_retry_config
 from gcsfs.zb_hns_utils import MRD_MAX_RANGES, DirectMemmoveBuffer, MRDPool
 from gcsfs.zonal_file import ZonalFile
@@ -1090,7 +1090,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                 request_id=request_id,
             )
         except asyncio.TimeoutError as e:
-            op_name = _get_operation_name(operation) or request_id
+            op_name = operation.operation.name or request_id
             raise TimeoutError(
                 f"HNS folder rename from '{path1}' to '{path2}' (op: {op_name}) "
                 f"did not finish within {DEFAULT_HNS_LRO_TIMEOUT:g}s. The rename "
