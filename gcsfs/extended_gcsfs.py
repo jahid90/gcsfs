@@ -1083,13 +1083,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                 cancelled and may still complete.
         """
         try:
-            await poll_lro(
-                operation,
-                timeout=HNS_RENAME_FOLDER_LRO_TIMEOUT,
-                path1=path1,
-                path2=path2,
-                request_id=request_id,
-            )
+            await poll_lro(operation, timeout=HNS_RENAME_FOLDER_LRO_TIMEOUT)
         except asyncio.TimeoutError as e:
             op_name = operation.operation.name or request_id
             raise TimeoutError(

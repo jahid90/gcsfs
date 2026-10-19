@@ -666,13 +666,7 @@ class TestExtendedGcsFileSystemMv:
             gcsfs.mv(path1, path2)
 
             operation = mocks["control_client"].rename_folder.return_value
-            mock_poll_lro.assert_awaited_once_with(
-                operation,
-                timeout=300.0,
-                path1=path1,
-                path2=path2,
-                request_id=FIXED_REQUEST_ID,
-            )
+            mock_poll_lro.assert_awaited_once_with(operation, timeout=300.0)
             operation.result.assert_not_called()
             mocks["super_mv"].assert_not_called()
 
