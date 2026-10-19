@@ -1201,10 +1201,16 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             if isinstance(e, api_exceptions.FailedPrecondition):
                 raise OSError(f"HNS rename failed: {e}") from e
             if rename_submitted:
-                # The rename may still be running or may already have finished
-                # on the server, so an object-level copy-and-delete could race
-                # with it.
-                raise
+                # Re-raise if the server may have renamed the folder: (1) the
+                # rename may still be running (a status check failed or the
+                # wait timed out), or (2) it finished and a later step, such
+                # as the dircache update, failed. A copy-and-delete would race
+                # with or repeat the rename. (3) If the operation finished
+                # with an error, nothing was renamed, so fall back.
+                if not (
+                    operation.operation.done and operation.operation.HasField("error")
+                ):
+                    raise
 
             logger.warning(f"Could not perform HNS-aware mv: {e}")
 

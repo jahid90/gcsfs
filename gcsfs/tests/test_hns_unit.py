@@ -792,14 +792,11 @@ class TestExtendedGcsFileSystemMv:
 
     @pytest.mark.parametrize("after", [0, 1], ids=["done_at_t0", "done_on_poll"])
     @pytest.mark.parametrize(
-        "code, expected_exc",
-        [
-            (code_pb2.PERMISSION_DENIED, api_exceptions.PermissionDenied),
-            (code_pb2.INTERNAL, api_exceptions.InternalServerError),
-        ],
+        "code",
+        [code_pb2.PERMISSION_DENIED, code_pb2.INTERNAL],
         ids=["permission_denied", "internal"],
     )
-    def test_hns_rename_other_operation_error_raises_without_fallback(
+    def test_hns_rename_unmapped_operation_error_falls_back(
         self,
         gcs_hns,
         gcs_hns_mocks,
@@ -807,10 +804,9 @@ class TestExtendedGcsFileSystemMv:
         monkeypatch,
         after,
         code,
-        expected_exc,
     ):
-        """An operation error without a specific mapping is raised as is. The
-        rename was already submitted, so there is no object-level fallback."""
+        """An operation that finished with an unmapped error renamed nothing,
+        so mv drops the cached listings and falls back to object-level mv."""
         gcsfs = gcs_hns
         path1 = f"{TEST_HNS_BUCKET}/src_dir"
         path2 = f"{TEST_HNS_BUCKET}/dst_dir"
@@ -828,12 +824,13 @@ class TestExtendedGcsFileSystemMv:
         ):
             mocks["info"].return_value = {"type": "directory", "name": path1}
             mocks["control_client"].rename_folder.return_value = lro.op
+            gcsfs.dircache[path1] = [{"name": f"{path1}/f.txt", "type": "file"}]
 
-            with pytest.raises(expected_exc):
-                gcsfs.mv(path1, path2)
+            gcsfs.mv(path1, path2)
 
-            mocks["super_mv"].assert_not_called()
+            mocks["super_mv"].assert_awaited_once_with(path1, path2)
             mock_mv_file.assert_not_called()
+            assert path1 not in gcsfs.dircache
 
         assert lro.get_operation.await_count == after
         lro.cancel_operation.assert_not_awaited()
