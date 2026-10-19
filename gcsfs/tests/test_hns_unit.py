@@ -23,7 +23,7 @@ from google.cloud import storage_control_v2
 from google.rpc import code_pb2
 
 from gcsfs.extended_gcsfs import BucketType, ExtendedGcsFileSystem
-from gcsfs.poller import _BACKGROUND_TASKS, PollSchedule
+from gcsfs.poller import _BACKGROUND_TASKS
 from gcsfs.retry import DEFAULT_RETRY_CONFIG, HttpError
 from gcsfs.tests.conftest import requires_hns
 from gcsfs.tests.lro_fakes import operation_pb
@@ -626,10 +626,7 @@ class TestExtendedGcsFileSystemMv:
         gcsfs = gcs_hns
         path1 = f"{TEST_HNS_BUCKET}/src_dir"
         path2 = f"{TEST_HNS_BUCKET}/dst_dir"
-        monkeypatch.setattr(
-            "gcsfs.poller.get_default_hns_lro_cadence",
-            lambda: PollSchedule(lambda status: 0.0),
-        )
+        monkeypatch.setattr("gcsfs.poller._calculate_poll_delay", lambda elapsed: 0.0)
         lro = fake_lro.succeeded(after=2)
 
         with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
@@ -679,10 +676,7 @@ class TestExtendedGcsFileSystemMv:
         path1 = f"{TEST_HNS_BUCKET}/src_timeout"
         path2 = f"{TEST_HNS_BUCKET}/dst_timeout"
         name = "projects/_/buckets/b/operations/op-timeout"
-        monkeypatch.setattr(
-            "gcsfs.poller.get_default_hns_lro_cadence",
-            lambda: PollSchedule(lambda status: 0.05),
-        )
+        monkeypatch.setattr("gcsfs.poller._calculate_poll_delay", lambda elapsed: 0.05)
         monkeypatch.setattr("gcsfs.extended_gcsfs.HNS_RENAME_FOLDER_LRO_TIMEOUT", 0.2)
         lro = fake_lro.pending(name=name)
 
@@ -761,10 +755,7 @@ class TestExtendedGcsFileSystemMv:
         gcsfs = gcs_hns
         path1 = f"{TEST_HNS_BUCKET}/src_dir"
         path2 = f"{TEST_HNS_BUCKET}/dst_dir"
-        monkeypatch.setattr(
-            "gcsfs.poller.get_default_hns_lro_cadence",
-            lambda: PollSchedule(lambda status: 0.0),
-        )
+        monkeypatch.setattr("gcsfs.poller._calculate_poll_delay", lambda elapsed: 0.0)
         lro = fake_lro.failed(code, after=after)
 
         with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
@@ -804,10 +795,7 @@ class TestExtendedGcsFileSystemMv:
         gcsfs = gcs_hns
         path1 = f"{TEST_HNS_BUCKET}/src_dir"
         path2 = f"{TEST_HNS_BUCKET}/dst_dir"
-        monkeypatch.setattr(
-            "gcsfs.poller.get_default_hns_lro_cadence",
-            lambda: PollSchedule(lambda status: 0.0),
-        )
+        monkeypatch.setattr("gcsfs.poller._calculate_poll_delay", lambda elapsed: 0.0)
         lro = fake_lro.failed(code, after=after)
 
         with (
@@ -837,10 +825,7 @@ class TestExtendedGcsFileSystemMv:
         gcsfs = gcs_hns
         path1 = f"{TEST_HNS_BUCKET}/src_dir"
         path2 = f"{TEST_HNS_BUCKET}/dst_dir"
-        monkeypatch.setattr(
-            "gcsfs.poller.get_default_hns_lro_cadence",
-            lambda: PollSchedule(lambda status: 0.0),
-        )
+        monkeypatch.setattr("gcsfs.poller._calculate_poll_delay", lambda elapsed: 0.0)
         error = api_exceptions.PermissionDenied("no access to operation")
         lro = fake_lro.sequence([error])
 
@@ -926,10 +911,7 @@ class TestExtendedGcsFileSystemMv:
         gcsfs = gcs_hns
         path1 = f"{TEST_HNS_BUCKET}/src_dir"
         path2 = f"{TEST_HNS_BUCKET}/dst_dir"
-        monkeypatch.setattr(
-            "gcsfs.poller.get_default_hns_lro_cadence",
-            lambda: PollSchedule(lambda status: 0.0),
-        )
+        monkeypatch.setattr("gcsfs.poller._calculate_poll_delay", lambda elapsed: 0.0)
         lro = fake_lro.sequence(
             [
                 api_exceptions.ServiceUnavailable("transient"),
@@ -967,18 +949,19 @@ class TestExtendedGcsFileSystemMv:
         path2 = f"{TEST_HNS_BUCKET}/dst_cancel"
         waiting_after_first_poll = asyncio.Event()
 
-        def cadence(status):
-            if status.attempt == 1:
+        delay_calls = 0
+
+        def cadence(elapsed):
+            nonlocal delay_calls
+            delay_calls += 1
+            if delay_calls == 1:
                 return 0.0
             # Cancel while poll_until sleeps, after a status check has
             # finished. test_poller covers a cancel that races a check.
             waiting_after_first_poll.set()
             return 5.0
 
-        monkeypatch.setattr(
-            "gcsfs.poller.get_default_hns_lro_cadence",
-            lambda: PollSchedule(cadence),
-        )
+        monkeypatch.setattr("gcsfs.poller._calculate_poll_delay", cadence)
         lro = fake_lro.pending()
 
         with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
