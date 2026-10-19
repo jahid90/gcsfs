@@ -294,8 +294,6 @@ class TestPollRunners:
             lro.op,
             schedule=sched,
             timeout=300.0,
-            path1="b/src",
-            path2="b/dst",
             time_fn=clock.time,
             sleep_fn=clock.sleep,
         )
@@ -456,15 +454,12 @@ class TestPollRunners:
                 lro.op,
                 schedule=sched,
                 timeout=1.2,
-                path1="b/src",
-                path2="b/dst",
                 time_fn=clock.time,
                 sleep_fn=clock.sleep,
             )
 
         assert clock.now == pytest.approx(1.2)
-        # Polls at 0.5 s, 1.0 s and 1.2 s; the message names the operation
-        # once, without the paths.
+        # Polls at 0.5 s, 1.0 s and 1.2 s; the message names the operation.
         assert lro.get_operation.await_count == 3
         assert str(exc_info.value) == (
             "Polling timed out for 'projects/_/buckets/b/operations/op-stalled' "
@@ -518,7 +513,9 @@ class TestPollRunners:
             await _unwrap_operation_result(operation)
 
     @pytest.mark.asyncio
-    async def test_poll_lro_cancellation_dispatches_server_cancel(self, fake_lro):
+    async def test_poll_lro_cancellation_dispatches_server_cancel(
+        self, fake_lro, caplog
+    ):
         clock = FakeVirtualClock()
         # The 1st poll is cancelled; the real AsyncOperation.cancel() then polls
         # once more (still pending) before sending CancelOperation.
@@ -528,18 +525,19 @@ class TestPollRunners:
         )
 
         sched = PollSchedule.linear_elapsed(0.05).floor(0.200)
-        with pytest.raises(asyncio.CancelledError):
-            await poll_lro(
-                lro.op,
-                schedule=sched,
-                path1="b/src",
-                path2="b/dst",
-                time_fn=clock.time,
-                sleep_fn=clock.sleep,
-            )
+        with caplog.at_level("WARNING", logger="gcsfs"):
+            with pytest.raises(asyncio.CancelledError):
+                await poll_lro(
+                    lro.op,
+                    schedule=sched,
+                    time_fn=clock.time,
+                    sleep_fn=clock.sleep,
+                )
 
         await asyncio.gather(*list(_BACKGROUND_TASKS), return_exceptions=True)
         lro.cancel_operation.assert_awaited_once()
+        [warning] = [r.getMessage() for r in caplog.records if "cancelled" in r.msg]
+        assert warning.count(name) == 1
 
     @pytest.mark.asyncio
     async def test_poll_lro_cancellation_bounds_hung_server_cancel(

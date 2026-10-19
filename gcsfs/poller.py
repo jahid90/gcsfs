@@ -497,11 +497,9 @@ async def _wait_keeping_cancel(aw: Awaitable[T], timeout: float) -> T:
 
 async def poll_lro(
     operation: AsyncOperation,
+    *,
     schedule: Optional[PollSchedule] = None,
     timeout: Optional[float] = None,
-    path1: Optional[str] = None,
-    path2: Optional[str] = None,
-    request_id: Optional[str] = None,
     time_fn: Callable[[], float] = time.monotonic,
     sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> Any:
@@ -518,10 +516,6 @@ async def poll_lro(
         timeout: Optional overall timeout budget in seconds. When provided, wraps
             the active schedule with ``.max_duration(timeout)``. ``None`` means
             no overall limit.
-        path1: Optional source path for diagnostic logging context.
-        path2: Optional destination path for diagnostic logging context.
-        request_id: Optional fallback identifier used in logs when the operation
-            does not expose a server-side name.
         time_fn: Monotonic clock function returning current time in seconds.
         sleep_fn: Async sleep function accepting a delay in seconds.
 
@@ -546,13 +540,12 @@ async def poll_lro(
         )
     _validate_lro_timeout(timeout)
 
-    op_id = operation.operation.name or request_id or "LRO"
-    path_ctx = f"'{path1}' -> '{path2}'" if path1 and path2 else op_id
+    op_id = operation.operation.name or "LRO"
 
     if operation.operation.done:
         logger.debug(
             "LRO %s completed synchronously in memory at t=0; skipping polling.",
-            path_ctx,
+            op_id,
         )
         return await _unwrap_operation_result(operation)
 
@@ -591,11 +584,10 @@ async def poll_lro(
     except asyncio.CancelledError:
         elapsed = time_fn() - start_time
         logger.warning(
-            "LRO %s polling cancelled after %.3fs (op: %s); "
+            "LRO %s polling cancelled after %.3fs; "
             "dispatching server-side cancellation signal.",
-            path_ctx,
-            elapsed,
             op_id,
+            elapsed,
         )
 
         async def _send_cancel() -> None:
