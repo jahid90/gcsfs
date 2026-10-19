@@ -603,15 +603,7 @@ def zonal_write_mocks():
 
 @pytest.fixture
 def fake_lro():
-    """Builds correctly shaped long-running operation doubles.
-
-    Returns a ``FakeLroFactory``: ``fake_lro.pending()``,
-    ``fake_lro.succeeded(response=None, after=0)``,
-    ``fake_lro.failed(error, after=0)`` and ``fake_lro.sequence([...])``. Each
-    returns a ``FakeLro`` with a real ``AsyncOperation`` (``.op``) and the
-    GetOperation/CancelOperation mocks behind it. See
-    ``gcsfs/tests/lro_fakes.py`` for details and pitfalls.
-    """
+    """Factory for LRO test doubles (see gcsfs/tests/lro_fakes.py)."""
     return FakeLroFactory()
 
 
