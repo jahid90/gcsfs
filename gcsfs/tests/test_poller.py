@@ -1,5 +1,6 @@
 import asyncio
 import math
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -511,6 +512,22 @@ class TestPollRunners:
 
         with pytest.raises(expected_cls):
             await _unwrap_operation_result(operation)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error",
+        [object(), SimpleNamespace(code="INTERNAL"), SimpleNamespace(code=[13])],
+        ids=["no_code", "str_code", "unhashable_code"],
+    )
+    async def test_unwrap_operation_result_reraises_error_without_int_code(self, error):
+        operation = mock.AsyncMock()
+        raw_err = api_exceptions.GoogleAPICallError("LRO failed", errors=[error])
+        operation.result.side_effect = raw_err
+
+        with pytest.raises(api_exceptions.GoogleAPICallError) as exc_info:
+            await _unwrap_operation_result(operation)
+
+        assert exc_info.value is raw_err
 
     @pytest.mark.asyncio
     async def test_poll_lro_cancellation_dispatches_server_cancel(

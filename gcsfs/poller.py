@@ -417,12 +417,14 @@ async def _unwrap_operation_result(operation: AsyncOperation) -> Any:
         return await operation.result()
     except api_exceptions.GoogleAPICallError as e:
         if type(e) is api_exceptions.GoogleAPICallError and e.errors:
-            raise api_exceptions.from_grpc_status(
-                e.errors[0].code,
-                e.message,
-                errors=e.errors,
-                response=e.response,
-            ) from e
+            code = getattr(e.errors[0], "code", None)
+            if isinstance(code, int):
+                raise api_exceptions.from_grpc_status(
+                    code,
+                    e.message,
+                    errors=e.errors,
+                    response=e.response,
+                ) from e
         raise
 
 
