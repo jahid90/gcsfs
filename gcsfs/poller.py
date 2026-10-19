@@ -19,6 +19,10 @@ _BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
 PER_POLL_RPC_TIMEOUT: float = 15.0
 #: Polls that finish after this many seconds log at INFO instead of DEBUG.
 SLOW_LRO_LOG_THRESHOLD: float = 2.0
+#: After n consecutive transient errors, the next delay is at least
+#: min(base * 2 ** (n - 1), cap / 1.25), jittered by 0.75-1.25.
+_TRANSIENT_ERROR_BACKOFF_BASE: float = 0.5
+_TRANSIENT_ERROR_BACKOFF_CAP: float = 30.0
 
 
 def _calculate_poll_delay(
@@ -69,7 +73,8 @@ async def poll_until(
 
     Args:
         check_fn: Async callable returning ``(is_done, result)``. Transient
-            errors are retried on the next poll; other errors are raised.
+            errors are retried on the next poll, with an exponential backoff
+            while they repeat; other errors are raised.
         delay_fn: Maps the elapsed seconds to the delay before the next check.
         timeout: Overall limit in seconds, or ``None`` for no limit.
         operation_id: Name used in log and error messages.
@@ -87,6 +92,7 @@ async def poll_until(
     logger.debug("Starting polling%s...", op_desc)
 
     attempts = 1
+    transient_errors = 0
     last_exc: Optional[Exception] = None
     while True:
         elapsed = time_fn() - start_time
@@ -105,6 +111,13 @@ async def poll_until(
             ) from last_exc
 
         delay = delay_fn(elapsed)
+        if transient_errors:
+            # The exponent is bounded so a long outage can't overflow a float.
+            backoff = min(
+                _TRANSIENT_ERROR_BACKOFF_BASE * 2 ** min(transient_errors - 1, 16),
+                _TRANSIENT_ERROR_BACKOFF_CAP / 1.25,
+            )
+            delay = max(delay, backoff * random.uniform(0.75, 1.25))
         if remaining is not None:
             delay = min(delay, remaining)
         logger.debug(
@@ -119,6 +132,7 @@ async def poll_until(
         try:
             is_done, result = await check_fn()
             last_exc = None
+            transient_errors = 0
             if is_done:
                 final_elapsed = time_fn() - start_time
                 log_level = (
@@ -138,6 +152,7 @@ async def poll_until(
             if not _is_transient_poll_exception(e):
                 raise
             last_exc = e
+            transient_errors += 1
             logger.debug(
                 "Transient transport error during status check #%d%s: %s",
                 attempts,

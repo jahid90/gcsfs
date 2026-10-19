@@ -156,6 +156,85 @@ class TestPollRunners:
         assert len(clock.sleeps) == 6
 
     @pytest.mark.asyncio
+    async def test_poll_until_backs_off_on_consecutive_transient_errors(self):
+        clock = FakeVirtualClock()
+        unavailable = api_exceptions.ServiceUnavailable("503")
+        check = mock.AsyncMock(
+            side_effect=[unavailable] * 3 + [(False, None), unavailable, (True, "ok")]
+        )
+
+        res = await poll_until(
+            check,
+            delay_fn=lambda elapsed: 0.1,
+            time_fn=clock.time,
+            sleep_fn=clock.sleep,
+        )
+
+        assert res == "ok"
+        first, *backoffs, after_success, after_one_error = clock.sleeps[:6]
+        assert first == 0.1
+        # Floors of 0.5, 1 and 2 s after 1, 2 and 3 consecutive errors, +-25%.
+        for sleep, floor in zip(backoffs, [0.5, 1.0, 2.0]):
+            assert 0.75 * floor <= sleep <= 1.25 * floor
+        # A successful check resets the count.
+        assert after_success == 0.1
+        assert 0.375 <= after_one_error <= 0.625
+
+    @pytest.mark.asyncio
+    async def test_poll_until_transient_backoff_is_capped(self):
+        clock = FakeVirtualClock()
+        check = mock.AsyncMock(
+            side_effect=[api_exceptions.TooManyRequests("429")] * 12 + [(True, "ok")]
+        )
+
+        await poll_until(
+            check,
+            delay_fn=lambda elapsed: 0.1,
+            time_fn=clock.time,
+            sleep_fn=clock.sleep,
+        )
+
+        assert max(clock.sleeps) <= 30.0
+        assert min(clock.sleeps[-3:]) >= 18.0
+
+    @pytest.mark.asyncio
+    async def test_poll_until_transient_backoff_is_clamped_to_the_deadline(self):
+        clock = FakeVirtualClock()
+        check = mock.AsyncMock(side_effect=api_exceptions.ServiceUnavailable("503"))
+
+        with pytest.raises(asyncio.TimeoutError):
+            await poll_until(
+                check,
+                delay_fn=lambda elapsed: 0.1,
+                timeout=3.0,
+                time_fn=clock.time,
+                sleep_fn=clock.sleep,
+            )
+
+        assert clock.now == pytest.approx(3.0)
+
+    @pytest.mark.asyncio
+    async def test_poll_until_non_transient_error_raises_without_backoff(self):
+        clock = FakeVirtualClock()
+        check = mock.AsyncMock(
+            side_effect=[
+                api_exceptions.ServiceUnavailable("503"),
+                api_exceptions.PermissionDenied("403"),
+            ]
+        )
+
+        with pytest.raises(api_exceptions.PermissionDenied):
+            await poll_until(
+                check,
+                delay_fn=lambda elapsed: 0.1,
+                time_fn=clock.time,
+                sleep_fn=clock.sleep,
+            )
+
+        assert check.await_count == 2
+        assert len(clock.sleeps) == 2
+
+    @pytest.mark.asyncio
     async def test_poll_until_keeps_polling_after_unknown(self):
         clock = FakeVirtualClock()
         check = mock.AsyncMock(
@@ -481,7 +560,10 @@ class TestPollRunners:
 
         await asyncio.wait_for(hung_check_cancelled.wait(), timeout=5.0)
         assert lro.get_operation.await_count == 2
-        assert clock.sleeps == [pytest.approx(0.2), pytest.approx(0.2)]
+        # The timed-out check counts as a transient error, so the next sleep
+        # is the first backoff step (0.5 s +-25%).
+        assert clock.sleeps[0] == pytest.approx(0.2)
+        assert 0.375 <= clock.sleeps[1] <= 0.625
         lro.cancel_operation.assert_not_awaited()
 
     @pytest.mark.asyncio
