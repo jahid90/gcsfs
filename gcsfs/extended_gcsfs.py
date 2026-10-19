@@ -1158,10 +1158,24 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                     timeout=STORAGE_CONTROL_RPC_TIMEOUT,
                 )
                 rename_submitted = True
-                await self._wait_for_folder_rename(
-                    operation, path1, path2, request.request_id
-                )
-                self._update_dircache_after_rename(path1, path2)
+                try:
+                    await self._wait_for_folder_rename(
+                        operation, path1, path2, request.request_id
+                    )
+                    self._update_dircache_after_rename(path1, path2)
+                except BaseException as e:
+                    # The rename may still be running or may already have
+                    # finished, so cached listings can't be trusted.
+                    self.invalidate_cache(path1)
+                    self.invalidate_cache(path2)
+                    logger.warning(
+                        "HNS rename '%s' -> '%s' did not complete (op: %s): %r",
+                        path1,
+                        path2,
+                        operation.operation.name or request.request_id,
+                        e,
+                    )
+                    raise
 
                 logger.debug(
                     "Successfully renamed folder from '%s' to '%s'", path1, path2
@@ -1189,9 +1203,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             if rename_submitted:
                 # The rename may still be running or may already have finished
                 # on the server, so an object-level copy-and-delete could race
-                # with it and cached listings can't be trusted.
-                self.invalidate_cache(path1)
-                self.invalidate_cache(path2)
+                # with it.
                 raise
 
             logger.warning(f"Could not perform HNS-aware mv: {e}")

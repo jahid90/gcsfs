@@ -762,7 +762,8 @@ class TestExtendedGcsFileSystemMv:
         match,
     ):
         """poll_lro raises operation errors as typed exceptions, so the
-        existing NotFound, Conflict and FailedPrecondition mappings apply."""
+        existing NotFound, Conflict and FailedPrecondition mappings apply, and
+        the cached listings for both paths are dropped."""
         gcsfs = gcs_hns
         path1 = f"{TEST_HNS_BUCKET}/src_dir"
         path2 = f"{TEST_HNS_BUCKET}/dst_dir"
@@ -775,11 +776,17 @@ class TestExtendedGcsFileSystemMv:
         with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
             mocks["info"].return_value = {"type": "directory", "name": path1}
             mocks["control_client"].rename_folder.return_value = lro.op
+            gcsfs.dircache[TEST_HNS_BUCKET] = [{"name": path1, "type": "directory"}]
+            gcsfs.dircache[path1] = [{"name": f"{path1}/f.txt", "type": "file"}]
+            gcsfs.dircache[path2] = [{"name": f"{path2}/g.txt", "type": "file"}]
 
             with pytest.raises(expected_exc, match=match):
                 gcsfs.mv(path1, path2)
 
             mocks["super_mv"].assert_not_called()
+            assert path1 not in gcsfs.dircache
+            assert path2 not in gcsfs.dircache
+            assert TEST_HNS_BUCKET not in gcsfs.dircache
 
         assert lro.get_operation.await_count == after
 
@@ -962,8 +969,8 @@ class TestExtendedGcsFileSystemMv:
     async def test_hns_rename_cancelled_while_polling_sends_cancel(
         self, gcs_hns, gcs_hns_mocks, fake_lro, monkeypatch
     ):
-        """Cancelling mv during poll_lro sends CancelOperation once and
-        propagates CancelledError without falling back."""
+        """Cancelling mv during poll_lro sends CancelOperation once, drops the
+        cached listings and propagates CancelledError without falling back."""
         gcsfs = gcs_hns
         path1 = f"{TEST_HNS_BUCKET}/src_cancel"
         path2 = f"{TEST_HNS_BUCKET}/dst_cancel"
@@ -986,6 +993,9 @@ class TestExtendedGcsFileSystemMv:
         with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
             mocks["info"].return_value = {"type": "directory", "name": path1}
             mocks["control_client"].rename_folder.return_value = lro.op
+            gcsfs.dircache[TEST_HNS_BUCKET] = [{"name": path1, "type": "directory"}]
+            gcsfs.dircache[path1] = [{"name": f"{path1}/f.txt", "type": "file"}]
+            gcsfs.dircache[path2] = [{"name": f"{path2}/g.txt", "type": "file"}]
 
             task = asyncio.create_task(gcsfs._mv(path1, path2))
             await asyncio.wait_for(waiting_after_first_poll.wait(), timeout=5.0)
@@ -999,6 +1009,9 @@ class TestExtendedGcsFileSystemMv:
             await asyncio.sleep(0)
 
             mocks["super_mv"].assert_not_called()
+            assert path1 not in gcsfs.dircache
+            assert path2 not in gcsfs.dircache
+            assert TEST_HNS_BUCKET not in gcsfs.dircache
 
         lro.cancel_operation.assert_awaited_once()
         assert not _BACKGROUND_TASKS
