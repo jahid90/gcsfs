@@ -49,10 +49,6 @@ USER_AGENT = "python-gcsfs"
 STORAGE_CONTROL_RPC_TIMEOUT = 30.0
 
 
-class _FolderRenameTimeoutError(OSError):
-    """Waiting for an HNS folder rename timed out; it may still complete."""
-
-
 class BucketType(Enum):
     ZONAL_HIERARCHICAL = "ZONAL_HIERARCHICAL"
     HIERARCHICAL = "HIERARCHICAL"
@@ -1082,8 +1078,8 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         Polls with ``poll_lro`` for at most ``DEFAULT_HNS_LRO_TIMEOUT`` seconds.
 
         Raises:
-            _FolderRenameTimeoutError: If polling times out. The server-side
-                rename is not cancelled and may still complete.
+            TimeoutError: If polling times out. The server-side rename is not
+                cancelled and may still complete.
         """
         try:
             await poll_lro(
@@ -1094,11 +1090,8 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                 request_id=request_id,
             )
         except asyncio.TimeoutError as e:
-            # The rename may finish later, so cached listings can't be trusted.
-            self.invalidate_cache(path1)
-            self.invalidate_cache(path2)
             op_name = _get_operation_name(operation) or request_id
-            raise _FolderRenameTimeoutError(
+            raise TimeoutError(
                 f"HNS folder rename from '{path1}' to '{path2}' (op: {op_name}) "
                 f"did not finish within {DEFAULT_HNS_LRO_TIMEOUT:g}s. The rename "
                 "may still complete on the server; check the destination before "
@@ -1178,10 +1171,6 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                 await self._mv_file(path1, path2)
                 return
         except Exception as e:
-            if isinstance(e, _FolderRenameTimeoutError):
-                # The rename may still be running on the server, so an
-                # object-level fallback could race with it.
-                raise
             if isinstance(e, FileNotFoundError):
                 # If the source doesn't exist, fail fast.
                 raise

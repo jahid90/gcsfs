@@ -679,7 +679,7 @@ class TestExtendedGcsFileSystemMv:
     def test_hns_rename_poll_timeout_raises_without_fallback(
         self, gcs_hns, gcs_hns_mocks, fake_lro, monkeypatch
     ):
-        """A poll_lro timeout raises OSError with a hint, invalidates the
+        """A poll_lro timeout raises TimeoutError with a hint, invalidates the
         dircache and neither falls back nor cancels the server-side rename."""
         gcsfs = gcs_hns
         path1 = f"{TEST_HNS_BUCKET}/src_timeout"
@@ -699,7 +699,7 @@ class TestExtendedGcsFileSystemMv:
             gcsfs.dircache[path1] = [{"name": f"{path1}/f.txt", "type": "file"}]
             gcsfs.dircache[path2] = [{"name": f"{path2}/g.txt", "type": "file"}]
 
-            with pytest.raises(OSError) as exc_info:
+            with pytest.raises(TimeoutError) as exc_info:
                 gcsfs.mv(path1, path2)
 
             mocks["super_mv"].assert_not_called()
@@ -707,13 +707,18 @@ class TestExtendedGcsFileSystemMv:
             assert path2 not in gcsfs.dircache
             assert TEST_HNS_BUCKET not in gcsfs.dircache
 
-        assert not isinstance(exc_info.value, (FileNotFoundError, FileExistsError))
-        assert str(exc_info.value) == (
+        # On Python 3.11+ fsspec's sync wrapper replaces any TimeoutError with
+        # an empty FSTimeoutError chained to the original.
+        err = exc_info.value
+        if type(err) is not TimeoutError:
+            err = err.__cause__
+        assert type(err) is TimeoutError
+        assert str(err) == (
             f"HNS folder rename from '{path1}' to '{path2}' (op: {name}) did not "
             "finish within 0.2s. The rename may still complete on the server; "
             "check the destination before retrying."
         )
-        assert isinstance(exc_info.value.__cause__, asyncio.TimeoutError)
+        assert isinstance(err.__cause__, asyncio.TimeoutError)
         assert lro.get_operation.await_count >= 1
         lro.cancel_operation.assert_not_awaited()
 
