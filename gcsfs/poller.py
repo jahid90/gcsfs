@@ -294,7 +294,7 @@ async def poll_until(
 
     This runner follows a sleep-then-check cadence on every iteration. Callers
     that can satisfy completion synchronously at ``t=0`` (for example,
-    ``poll_lro``'s in-memory ``_is_operation_already_done_in_memory`` pre-check)
+    ``poll_lro``'s check of ``operation.operation.done``)
     should perform that initial check before invoking ``poll_until``, or else
     incur the overhead of the first scheduled sleep.
 
@@ -431,31 +431,6 @@ async def _unwrap_operation_result(
         raise
 
 
-def _is_operation_already_done_in_memory(operation: AsyncOperation) -> bool:
-    """Zero-RPC check inspecting the operation proto for completion at t=0.
-
-    Args:
-        operation: GAPIC ``AsyncOperation`` to inspect.
-
-    Returns:
-        Whether the ``google.longrunning.Operation`` proto the operation
-        currently holds is already marked done.
-    """
-    return operation.operation.done
-
-
-def _get_operation_name(operation: AsyncOperation) -> Optional[str]:
-    """Extracts the server-side operation name from a GAPIC AsyncOperation.
-
-    Args:
-        operation: GAPIC ``AsyncOperation`` to inspect.
-
-    Returns:
-        The server-side operation name, or ``None`` if it is empty.
-    """
-    return operation.operation.name or None
-
-
 def _validate_lro_timeout(timeout: Optional[float], name: str = "timeout") -> None:
     """Checks an overall LRO timeout before any work starts.
 
@@ -573,11 +548,10 @@ async def poll_lro(
         )
     _validate_lro_timeout(timeout)
 
-    op_name = _get_operation_name(operation)
-    op_id = op_name if op_name else (request_id or "LRO")
+    op_id = operation.operation.name or request_id or "LRO"
     path_ctx = f"'{path1}' -> '{path2}'" if path1 and path2 else op_id
 
-    if _is_operation_already_done_in_memory(operation):
+    if operation.operation.done:
         logger.debug(
             "LRO %s completed synchronously in memory at t=0; skipping polling.",
             path_ctx,
