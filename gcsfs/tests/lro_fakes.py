@@ -1,58 +1,19 @@
-"""Correctly shaped long-running operation (LRO) doubles for tests.
+"""Long-running operation (LRO) test doubles shaped like GAPIC's.
 
-Every ``FakeLroFactory`` constructor returns a ``FakeLro`` whose ``op`` is a
-real ``google.api_core.operation_async.AsyncOperation`` wrapping a real
-``google.longrunning.Operation`` proto. Only the two transport calls behind it
-are mocked: ``get_operation`` (GetOperation; one await per server poll) and
-``cancel_operation`` (CancelOperation). Code under test therefore sees the same
-public shape that GAPIC clients return: ``op.operation.done``,
-``op.operation.name``, ``await op.done(retry=...)``, ``await op.result()`` and
-``await op.cancel()``.
+Each ``FakeLroFactory`` method returns a ``FakeLro`` whose ``op`` is a real
+``AsyncOperation`` over a real ``google.longrunning.Operation`` proto; only the
+GetOperation and CancelOperation transport calls are mocked::
 
-Tests normally use the ``fake_lro`` fixture from ``conftest.py``::
+    lro = fake_lro.succeeded(after=3)          # done on the 3rd poll
+    lro = fake_lro.failed(code_pb2.ABORTED)    # failed at t=0
+    lro = fake_lro.pending()                   # never finishes
+    lro = fake_lro.sequence([ServiceUnavailable("blip"), operation_pb(done=True)])
 
-    lro = fake_lro.succeeded()                   # done at t=0, Empty response
-    lro = fake_lro.succeeded(after=3)            # done on the 3rd poll
-    lro = fake_lro.failed(code_pb2.ABORTED)      # failed at t=0
-    lro = fake_lro.failed(status_pb2.Status(code=code_pb2.NOT_FOUND), after=2)
-    lro = fake_lro.pending()                     # never finishes
-    lro = fake_lro.sequence(
-        [
-            api_exceptions.ServiceUnavailable("blip"),  # 1st poll raises
-            operation_pb(done=True),                    # 2nd poll finishes
-        ]
-    )
+An ``AsyncOperation`` is bound to the event loop it was built on, so await it
+there: the factory builds on the running loop in async tests and on fsspec's IO
+loop (where sync ``gcsfs`` calls run) otherwise.
 
-``after=N`` is the number of polls until the terminal state: ``after=0`` means
-the operation is already terminal when the RPC returns it (t=0), so the
-in-memory check sees it without polling.
-
-Pitfalls:
-
-* Event loop: ``AsyncOperation`` binds a future to the current event loop when
-  it is built, so it must be awaited on that loop. The factory builds on the
-  running loop in async tests, and otherwise on fsspec's IO loop, which is
-  where sync ``gcsfs`` calls such as ``fs.mv`` run. Don't build an op in a sync
-  test and then await it on another loop (for example via ``asyncio.run``).
-* Unread failures: a failed op stores its exception on that future as soon as
-  it reaches the terminal state. If nothing ever calls ``op.result()``,
-  asyncio logs "Future exception was never retrieved" when the op is garbage
-  collected. That doesn't fail the test; run ``pytest -s -p no:logging`` to
-  see it.
-* Real sleeps in sync tests: code that polls with the default HNS cadence
-  (about 150-250 ms per early poll) sleeps for real, so a sync test that
-  drives it with ``after=N`` waits about N times that. To speed such a test
-  up, patch the cadence, for example::
-
-      monkeypatch.setattr(
-          "gcsfs.poller.get_default_hns_lro_cadence",
-          lambda: PollSchedule(lambda status: 0.0),
-      )
-
-* ``op.cancel()`` polls first: the real ``AsyncOperation.cancel()`` awaits
-  ``done()`` before sending CancelOperation. It costs one extra
-  ``get_operation`` call and only awaits ``cancel_operation`` while the op is
-  still pending.
+``FakeClock`` runs ``gcsfs.poller``'s polling loop on virtual time.
 """
 
 import asyncio
@@ -288,6 +249,9 @@ class FakeLroFactory:
         result_type: Optional[type],
     ) -> FakeLro:
         get_operation = mock.AsyncMock(side_effect=_replay(steps))
+        # The real AsyncOperation.cancel() awaits done() first: one extra
+        # get_operation call, and cancel_operation is only awaited while the
+        # op is still pending.
         cancel_operation = mock.AsyncMock(return_value=None)
 
         def _new_op() -> operation_async.AsyncOperation:
@@ -314,3 +278,28 @@ class FakeLroFactory:
         return FakeLro(
             op=op, get_operation=get_operation, cancel_operation=cancel_operation
         )
+
+
+class FakeClock:
+    """Virtual clock for ``gcsfs.poller``: sleeps return at once and advance ``now``.
+
+    ``patch(monkeypatch)`` replaces ``gcsfs.poller._monotonic`` and
+    ``gcsfs.poller._sleep`` only. Never patch ``time.monotonic`` or
+    ``asyncio.sleep`` globally: the event loop itself uses them.
+    """
+
+    def __init__(self, start: float = 0.0):
+        self.now = start
+        self.sleeps: list[float] = []
+
+    def time(self) -> float:
+        return self.now
+
+    async def sleep(self, delay: float) -> None:
+        self.sleeps.append(delay)
+        self.now += delay
+
+    def patch(self, monkeypatch) -> "FakeClock":
+        monkeypatch.setattr("gcsfs.poller._monotonic", self.time)
+        monkeypatch.setattr("gcsfs.poller._sleep", self.sleep)
+        return self

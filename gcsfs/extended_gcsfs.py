@@ -38,7 +38,7 @@ from gcsfs.core import (
     _location,
     _resolve_generation_match,
 )
-from gcsfs.poller import DEFAULT_HNS_LRO_TIMEOUT, _get_operation_name, poll_lro
+from gcsfs.poller import poll_lro, unwrap_operation_result
 from gcsfs.retry import DEFAULT_RETRY_CONFIG, get_storage_control_retry_config
 from gcsfs.zb_hns_utils import MRD_MAX_RANGES, DirectMemmoveBuffer, MRDPool
 from gcsfs.zonal_file import ZonalFile
@@ -47,10 +47,22 @@ logger = logging.getLogger("gcsfs")
 
 USER_AGENT = "python-gcsfs"
 STORAGE_CONTROL_RPC_TIMEOUT = 30.0
+HNS_RENAME_FOLDER_LRO_TIMEOUT = 300.0
 
 
-class _FolderRenameTimeoutError(OSError):
-    """Waiting for an HNS folder rename timed out; it may still complete."""
+def _parse_bool(value, name):
+    """Returns ``value`` as a bool, accepting the strings fsspec config can pass."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("1", "true", "yes", "on"):
+            return True
+        if lowered in ("0", "false", "no", "off"):
+            return False
+    raise ValueError(f"{name} must be a boolean, got {value!r}")
 
 
 class BucketType(Enum):
@@ -128,6 +140,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         finalize_on_close=False,
         mrd_pool_cache_size=16,
         max_mrd_pool_cache_queue_size=16,
+        fast_lro_polling=True,
         **kwargs,
     ):
         """
@@ -139,6 +152,11 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             Maximum number of idle pools to retain in the cache.
         max_mrd_pool_cache_queue_size : int, default 16
             Maximum number of idle MRDs per key in the cache.
+        fast_lro_polling : bool, default True
+            Wait for HNS folder renames with gcsfs's own poller, which checks
+            often early on and gives up after a timeout. Set to False (or set
+            ``FSSPEC_GCS_FAST_LRO_POLLING=false``) to wait with
+            ``operation.result()`` from google-api-core instead.
         **kwargs : dict
             Additional arguments passed to GCSFileSystem.
             Supports retry configuration overrides for Storage Control API:
@@ -148,6 +166,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             - retry_multiplier: Multiplier for delay between retries.
             These map to `google.api_core.retry.AsyncRetry` arguments (without 'retry_' prefix).
         """
+        self.fast_lro_polling = _parse_bool(fast_lro_polling, "fast_lro_polling")
         valid_keys = DEFAULT_RETRY_CONFIG.keys()
         self.retry_config = {
             k[6:]: v
@@ -1077,30 +1096,14 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         return bucket_type in [BucketType.ZONAL_HIERARCHICAL, BucketType.HIERARCHICAL]
 
     async def _wait_for_folder_rename(self, operation, path1, path2, request_id):
-        """Waits for a RenameFolder operation to finish.
-
-        Polls with ``poll_lro`` for at most ``DEFAULT_HNS_LRO_TIMEOUT`` seconds.
-
-        Raises:
-            _FolderRenameTimeoutError: If polling times out. The server-side
-                rename is not cancelled and may still complete.
-        """
+        """Waits for a RenameFolder operation with poll_lro; raises TimeoutError on timeout."""
         try:
-            await poll_lro(
-                operation,
-                timeout=DEFAULT_HNS_LRO_TIMEOUT,
-                path1=path1,
-                path2=path2,
-                request_id=request_id,
-            )
+            await poll_lro(operation, timeout=HNS_RENAME_FOLDER_LRO_TIMEOUT)
         except asyncio.TimeoutError as e:
-            # The rename may finish later, so cached listings can't be trusted.
-            self.invalidate_cache(path1)
-            self.invalidate_cache(path2)
-            op_name = _get_operation_name(operation) or request_id
-            raise _FolderRenameTimeoutError(
+            op_name = operation.operation.name or request_id
+            raise TimeoutError(
                 f"HNS folder rename from '{path1}' to '{path2}' (op: {op_name}) "
-                f"did not finish within {DEFAULT_HNS_LRO_TIMEOUT:g}s. The rename "
+                f"did not finish within {HNS_RENAME_FOLDER_LRO_TIMEOUT:g}s. The rename "
                 "may still complete on the server; check the destination before "
                 "retrying."
             ) from e
@@ -1165,10 +1168,27 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                     timeout=STORAGE_CONTROL_RPC_TIMEOUT,
                 )
                 rename_submitted = True
-                await self._wait_for_folder_rename(
-                    operation, path1, path2, request.request_id
-                )
-                self._update_dircache_after_rename(path1, path2)
+                try:
+                    if self.fast_lro_polling:
+                        await self._wait_for_folder_rename(
+                            operation, path1, path2, request.request_id
+                        )
+                    else:
+                        await unwrap_operation_result(operation)
+                    self._update_dircache_after_rename(path1, path2)
+                except BaseException as e:
+                    # The rename may still be running or may already have
+                    # finished, so cached listings can't be trusted.
+                    self.invalidate_cache(path1)
+                    self.invalidate_cache(path2)
+                    logger.warning(
+                        "HNS rename '%s' -> '%s' did not complete (op: %s): %r",
+                        path1,
+                        path2,
+                        operation.operation.name or request.request_id,
+                        e,
+                    )
+                    raise
 
                 logger.debug(
                     "Successfully renamed folder from '%s' to '%s'", path1, path2
@@ -1178,10 +1198,6 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                 await self._mv_file(path1, path2)
                 return
         except Exception as e:
-            if isinstance(e, _FolderRenameTimeoutError):
-                # The rename may still be running on the server, so an
-                # object-level fallback could race with it.
-                raise
             if isinstance(e, FileNotFoundError):
                 # If the source doesn't exist, fail fast.
                 raise
@@ -1198,12 +1214,16 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             if isinstance(e, api_exceptions.FailedPrecondition):
                 raise OSError(f"HNS rename failed: {e}") from e
             if rename_submitted:
-                # The rename may still be running or may already have finished
-                # on the server, so an object-level copy-and-delete could race
-                # with it and cached listings can't be trusted.
-                self.invalidate_cache(path1)
-                self.invalidate_cache(path2)
-                raise
+                # Re-raise if the server may have renamed the folder: (1) the
+                # rename may still be running (a status check failed or the
+                # wait timed out), or (2) it finished and a later step, such
+                # as the dircache update, failed. A copy-and-delete would race
+                # with or repeat the rename. (3) If the operation finished
+                # with an error, nothing was renamed, so fall back.
+                if not (
+                    operation.operation.done and operation.operation.HasField("error")
+                ):
+                    raise
 
             logger.warning(f"Could not perform HNS-aware mv: {e}")
 
