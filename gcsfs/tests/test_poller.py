@@ -17,19 +17,7 @@ from gcsfs.poller import (
     poll_until,
     unwrap_operation_result,
 )
-from gcsfs.tests.lro_fakes import FakeClock, FakeLroFactory, operation_pb
-
-
-@pytest.fixture
-def fake_lro():
-    """Same as the conftest fixture, so this module also runs with --noconftest."""
-    return FakeLroFactory()
-
-
-@pytest.fixture
-def fake_clock(monkeypatch):
-    """Same as the conftest fixture, so this module also runs with --noconftest."""
-    return FakeClock().patch(monkeypatch)
+from gcsfs.tests.lro_fakes import operation_pb
 
 
 def linear_delay(floor):
