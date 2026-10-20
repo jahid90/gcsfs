@@ -904,7 +904,7 @@ class TestExtendedGcsFileSystemMv:
             mocks["super_mv"].assert_awaited_once_with(path1, path2)
 
     def test_hns_rename_transient_status_check_error_keeps_waiting(
-        self, gcs_hns, gcs_hns_mocks, fake_lro, monkeypatch
+        self, gcs_hns, gcs_hns_mocks, fake_lro, fake_clock, monkeypatch
     ):
         """A transient GetOperation error (ServiceUnavailable) moves on to the
         next check instead of ending the wait and falling back."""
@@ -936,6 +936,10 @@ class TestExtendedGcsFileSystemMv:
             mock_mv_file.assert_not_called()
 
         assert lro.get_operation.await_count == 2
+        # The second check waits for the first backoff step (0.5 s +-25%).
+        first, backoff = fake_clock.sleeps
+        assert first == 0.0
+        assert 0.375 <= backoff <= 0.625
         lro.cancel_operation.assert_not_awaited()
 
     @pytest.mark.asyncio

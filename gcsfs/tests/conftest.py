@@ -19,7 +19,7 @@ from google.cloud.storage.asyncio.async_appendable_object_writer import (
 
 from gcsfs import GCSFileSystem
 from gcsfs.extended_gcsfs import BucketType
-from gcsfs.tests.lro_fakes import FakeLroFactory
+from gcsfs.tests.lro_fakes import FakeClock, FakeLroFactory
 from gcsfs.tests.settings import (
     TEST_BUCKET,
     TEST_HNS_BUCKET,
@@ -605,6 +605,12 @@ def zonal_write_mocks():
 def fake_lro():
     """Factory for LRO test doubles (see gcsfs/tests/lro_fakes.py)."""
     return FakeLroFactory()
+
+
+@pytest.fixture
+def fake_clock(monkeypatch):
+    """Virtual clock for gcsfs.poller's polling loop (see gcsfs/tests/lro_fakes.py)."""
+    return FakeClock().patch(monkeypatch)
 
 
 @pytest.fixture
