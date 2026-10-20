@@ -10,12 +10,14 @@ from google.rpc import code_pb2, status_pb2
 
 from gcsfs.poller import (
     _BACKGROUND_TASKS,
+    PER_POLL_RPC_TIMEOUT,
     _calculate_poll_delay,
+    _wait_keeping_cancel,
     poll_lro,
     poll_until,
     unwrap_operation_result,
 )
-from gcsfs.tests.lro_fakes import FakeLroFactory, operation_pb
+from gcsfs.tests.lro_fakes import FakeClock, FakeLroFactory, operation_pb
 
 
 @pytest.fixture
@@ -24,19 +26,10 @@ def fake_lro():
     return FakeLroFactory()
 
 
-class FakeVirtualClock:
-    """Deterministic virtual clock and sleep recorder for hermetic polling tests."""
-
-    def __init__(self, start: float = 0.0):
-        self.now = start
-        self.sleeps: list[float] = []
-
-    def time(self) -> float:
-        return self.now
-
-    async def sleep(self, delay: float) -> None:
-        self.sleeps.append(delay)
-        self.now += delay
+@pytest.fixture
+def fake_clock(monkeypatch):
+    """Same as the conftest fixture, so this module also runs with --noconftest."""
+    return FakeClock().patch(monkeypatch)
 
 
 def linear_delay(floor):
@@ -44,29 +37,41 @@ def linear_delay(floor):
     return lambda elapsed: max(0.05 * elapsed, floor)
 
 
+def set_jitter(monkeypatch, uniform):
+    """Makes the poller's random.uniform return ``uniform(a, b)``.
+
+    Swaps gcsfs.poller's reference to the random module, so the global
+    random.uniform stays untouched.
+    """
+    monkeypatch.setattr("gcsfs.poller.random", SimpleNamespace(uniform=uniform))
+
+
 class TestCalculatePollDelay:
     """Unit tests for the default polling cadence."""
 
-    def test_floor(self):
-        assert _calculate_poll_delay(0.0, random_fn=lambda a, b: 1.0) == 0.2
-        assert _calculate_poll_delay(0.5, random_fn=lambda a, b: 1.0) == 0.2
+    def test_floor(self, monkeypatch):
+        set_jitter(monkeypatch, lambda a, b: 1.0)
+        assert _calculate_poll_delay(0.0) == 0.2
+        assert _calculate_poll_delay(0.5) == 0.2
 
-    def test_grows_linearly_with_elapsed_time(self):
-        assert _calculate_poll_delay(10.0, random_fn=lambda a, b: 1.0) == 2.0
-        assert _calculate_poll_delay(
-            10.0, slope=0.05, random_fn=lambda a, b: 1.0
-        ) == pytest.approx(0.5)
+    def test_grows_linearly_with_elapsed_time(self, monkeypatch):
+        set_jitter(monkeypatch, lambda a, b: 1.0)
+        assert _calculate_poll_delay(10.0) == 2.0
+        monkeypatch.setattr("gcsfs.poller._POLL_DELAY_SLOPE", 0.05)
+        assert _calculate_poll_delay(10.0) == pytest.approx(0.5)
 
-    def test_cap_keeps_full_jitter_spread_below_cap(self):
+    def test_cap_keeps_full_jitter_spread_below_cap(self, monkeypatch):
         jitter_args = []
 
         def high(a, b):
             jitter_args.append((a, b))
             return b
 
-        assert _calculate_poll_delay(1000.0, random_fn=high) == 30.0
-        assert _calculate_poll_delay(1000.0, random_fn=lambda a, b: a) == 18.0
+        set_jitter(monkeypatch, high)
+        assert _calculate_poll_delay(1000.0) == 30.0
         assert jitter_args == [(0.75, 1.25)]
+        set_jitter(monkeypatch, lambda a, b: a)
+        assert _calculate_poll_delay(1000.0) == 18.0
 
     def test_default_cadence_bounds(self):
         for _ in range(50):
@@ -79,44 +84,33 @@ class TestPollRunners:
     """Virtual-time unit tests for poll_until, unwrap_operation_result, and poll_lro."""
 
     @pytest.mark.asyncio
-    async def test_zero_rpc_in_memory_check_completes_at_t0(self, fake_lro):
-        clock = FakeVirtualClock()
+    async def test_zero_rpc_in_memory_check_completes_at_t0(self, fake_lro, fake_clock):
         folder = storage_control_v2.Folder(name="projects/_/buckets/b/folders/dst/")
         lro = fake_lro.succeeded(folder, name="projects/_/buckets/b/operations/op-fast")
 
-        res = await poll_lro(
-            lro.op,
-            time_fn=clock.time,
-            sleep_fn=clock.sleep,
-        )
+        res = await poll_lro(lro.op, timeout=math.inf)
 
         assert res == folder
-        assert clock.sleeps == []
-        assert clock.now == 0.0
+        assert fake_clock.sleeps == []
+        assert fake_clock.now == 0.0
         lro.get_operation.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_poll_lro_polls_with_virtual_clock_until_done(
-        self, fake_lro, monkeypatch
+        self, fake_lro, fake_clock, monkeypatch
     ):
         monkeypatch.setattr("gcsfs.poller._calculate_poll_delay", linear_delay(0.2))
-        clock = FakeVirtualClock()
         folder = storage_control_v2.Folder(name="projects/_/buckets/b/folders/dst/")
         # Complete on the 3rd check
         lro = fake_lro.succeeded(
             folder, after=3, name="projects/_/buckets/b/operations/op-1"
         )
 
-        res = await poll_lro(
-            lro.op,
-            timeout=300.0,
-            time_fn=clock.time,
-            sleep_fn=clock.sleep,
-        )
+        res = await poll_lro(lro.op, timeout=300.0)
 
         assert res == folder
-        assert len(clock.sleeps) == 3
-        assert clock.sleeps[0] == pytest.approx(0.200)
+        assert len(fake_clock.sleeps) == 3
+        assert fake_clock.sleeps[0] == pytest.approx(0.200)
         assert lro.get_operation.await_count == 3
         # Every poll bypasses the GAPIC default retry; poll_until is the only
         # retry loop.
@@ -124,8 +118,30 @@ class TestPollRunners:
             assert call.kwargs["retry"] is None
 
     @pytest.mark.asyncio
-    async def test_poll_until_absorbs_transient_transport_glitches(self):
-        clock = FakeVirtualClock()
+    async def test_poll_lro_without_limit_keeps_full_per_poll_deadline(
+        self, fake_lro, fake_clock, monkeypatch
+    ):
+        monkeypatch.setattr("gcsfs.poller._calculate_poll_delay", lambda elapsed: 1e3)
+        rpc_timeouts = []
+
+        async def recording_wait(aw, timeout):
+            rpc_timeouts.append(timeout)
+            return await _wait_keeping_cancel(aw, timeout)
+
+        monkeypatch.setattr("gcsfs.poller._wait_keeping_cancel", recording_wait)
+        lro = fake_lro.succeeded(after=3)
+
+        await poll_lro(lro.op, timeout=math.inf)
+
+        # math.inf never clamps a sleep or shortens a status check's deadline.
+        assert fake_clock.sleeps == [1e3] * 3
+        assert rpc_timeouts == [PER_POLL_RPC_TIMEOUT] * 3
+
+    @pytest.mark.asyncio
+    async def test_poll_until_absorbs_transient_transport_glitches(
+        self, fake_clock, monkeypatch
+    ):
+        monkeypatch.setattr("gcsfs.poller._calculate_poll_delay", linear_delay(0.2))
         calls = 0
 
         async def flaky_check():
@@ -143,35 +159,26 @@ class TestPollRunners:
                 raise asyncio.TimeoutError("per-RPC deadline")
             return True, "recovered"
 
-        res = await poll_until(
-            flaky_check,
-            delay_fn=linear_delay(0.2),
-            operation_id="op-flaky",
-            time_fn=clock.time,
-            sleep_fn=clock.sleep,
-        )
+        res = await poll_until(flaky_check, timeout=math.inf, description="op-flaky")
 
         assert res == "recovered"
         assert calls == 6
-        assert len(clock.sleeps) == 6
+        assert len(fake_clock.sleeps) == 6
 
     @pytest.mark.asyncio
-    async def test_poll_until_backs_off_on_consecutive_transient_errors(self):
-        clock = FakeVirtualClock()
+    async def test_poll_until_backs_off_on_consecutive_transient_errors(
+        self, fake_clock, monkeypatch
+    ):
+        monkeypatch.setattr("gcsfs.poller._calculate_poll_delay", lambda elapsed: 0.1)
         unavailable = api_exceptions.ServiceUnavailable("503")
         check = mock.AsyncMock(
             side_effect=[unavailable] * 3 + [(False, None), unavailable, (True, "ok")]
         )
 
-        res = await poll_until(
-            check,
-            delay_fn=lambda elapsed: 0.1,
-            time_fn=clock.time,
-            sleep_fn=clock.sleep,
-        )
+        res = await poll_until(check, timeout=math.inf)
 
         assert res == "ok"
-        first, *backoffs, after_success, after_one_error = clock.sleeps[:6]
+        first, *backoffs, after_success, after_one_error = fake_clock.sleeps[:6]
         assert first == 0.1
         # Floors of 0.5, 1 and 2 s after 1, 2 and 3 consecutive errors, +-25%.
         for sleep, floor in zip(backoffs, [0.5, 1.0, 2.0]):
@@ -181,41 +188,36 @@ class TestPollRunners:
         assert 0.375 <= after_one_error <= 0.625
 
     @pytest.mark.asyncio
-    async def test_poll_until_transient_backoff_is_capped(self):
-        clock = FakeVirtualClock()
+    async def test_poll_until_transient_backoff_is_capped(
+        self, fake_clock, monkeypatch
+    ):
+        monkeypatch.setattr("gcsfs.poller._calculate_poll_delay", lambda elapsed: 0.1)
         check = mock.AsyncMock(
             side_effect=[api_exceptions.TooManyRequests("429")] * 12 + [(True, "ok")]
         )
 
-        await poll_until(
-            check,
-            delay_fn=lambda elapsed: 0.1,
-            time_fn=clock.time,
-            sleep_fn=clock.sleep,
-        )
+        await poll_until(check, timeout=math.inf)
 
-        assert max(clock.sleeps) <= 30.0
-        assert min(clock.sleeps[-3:]) >= 18.0
+        assert max(fake_clock.sleeps) <= 30.0
+        assert min(fake_clock.sleeps[-3:]) >= 18.0
 
     @pytest.mark.asyncio
-    async def test_poll_until_transient_backoff_is_clamped_to_the_deadline(self):
-        clock = FakeVirtualClock()
+    async def test_poll_until_transient_backoff_is_clamped_to_the_deadline(
+        self, fake_clock, monkeypatch
+    ):
+        monkeypatch.setattr("gcsfs.poller._calculate_poll_delay", lambda elapsed: 0.1)
         check = mock.AsyncMock(side_effect=api_exceptions.ServiceUnavailable("503"))
 
         with pytest.raises(asyncio.TimeoutError):
-            await poll_until(
-                check,
-                delay_fn=lambda elapsed: 0.1,
-                timeout=3.0,
-                time_fn=clock.time,
-                sleep_fn=clock.sleep,
-            )
+            await poll_until(check, timeout=3.0)
 
-        assert clock.now == pytest.approx(3.0)
+        assert fake_clock.now == pytest.approx(3.0)
 
     @pytest.mark.asyncio
-    async def test_poll_until_non_transient_error_raises_without_backoff(self):
-        clock = FakeVirtualClock()
+    async def test_poll_until_non_transient_error_raises_without_backoff(
+        self, fake_clock, monkeypatch
+    ):
+        monkeypatch.setattr("gcsfs.poller._calculate_poll_delay", lambda elapsed: 0.1)
         check = mock.AsyncMock(
             side_effect=[
                 api_exceptions.ServiceUnavailable("503"),
@@ -224,48 +226,37 @@ class TestPollRunners:
         )
 
         with pytest.raises(api_exceptions.PermissionDenied):
-            await poll_until(
-                check,
-                delay_fn=lambda elapsed: 0.1,
-                time_fn=clock.time,
-                sleep_fn=clock.sleep,
-            )
+            await poll_until(check, timeout=math.inf)
 
         assert check.await_count == 2
-        assert len(clock.sleeps) == 2
+        assert len(fake_clock.sleeps) == 2
 
     @pytest.mark.asyncio
-    async def test_poll_until_keeps_polling_after_unknown(self):
-        clock = FakeVirtualClock()
+    async def test_poll_until_keeps_polling_after_unknown(
+        self, fake_clock, monkeypatch
+    ):
+        monkeypatch.setattr("gcsfs.poller._calculate_poll_delay", linear_delay(0.2))
         check = mock.AsyncMock(
             side_effect=[api_exceptions.Unknown("transport reset"), (True, "ok")]
         )
 
-        res = await poll_until(
-            check,
-            delay_fn=linear_delay(0.2),
-            time_fn=clock.time,
-            sleep_fn=clock.sleep,
-        )
+        res = await poll_until(check, timeout=math.inf)
 
         assert res == "ok"
         assert check.await_count == 2
 
     @pytest.mark.asyncio
-    async def test_poll_until_reraises_non_transient_error(self):
-        clock = FakeVirtualClock()
+    async def test_poll_until_reraises_non_transient_error(
+        self, fake_clock, monkeypatch
+    ):
+        monkeypatch.setattr("gcsfs.poller._calculate_poll_delay", linear_delay(0.2))
         check = mock.AsyncMock(side_effect=api_exceptions.NotFound("no such op"))
 
         with pytest.raises(api_exceptions.NotFound, match="no such op"):
-            await poll_until(
-                check,
-                delay_fn=linear_delay(0.2),
-                time_fn=clock.time,
-                sleep_fn=clock.sleep,
-            )
+            await poll_until(check, timeout=math.inf)
 
         check.assert_awaited_once()
-        assert len(clock.sleeps) == 1
+        assert len(fake_clock.sleeps) == 1
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -276,20 +267,13 @@ class TestPollRunners:
         ],
     )
     async def test_poll_until_timeout_message_counts_status_checks(
-        self, max_seconds, expected_checks, expected_desc
+        self, fake_clock, monkeypatch, max_seconds, expected_checks, expected_desc
     ):
-        clock = FakeVirtualClock()
+        monkeypatch.setattr("gcsfs.poller._calculate_poll_delay", lambda elapsed: 0.5)
         check = mock.AsyncMock(return_value=(False, None))
 
         with pytest.raises(asyncio.TimeoutError) as exc_info:
-            await poll_until(
-                check,
-                delay_fn=lambda elapsed: 0.5,
-                timeout=max_seconds,
-                operation_id="op-1",
-                time_fn=clock.time,
-                sleep_fn=clock.sleep,
-            )
+            await poll_until(check, timeout=max_seconds, description="op-1")
 
         assert check.await_count == expected_checks
         assert str(exc_info.value) == (
@@ -298,27 +282,25 @@ class TestPollRunners:
         )
 
     @pytest.mark.asyncio
-    async def test_poll_until_timeout_chains_last_transient_error(self):
-        clock = FakeVirtualClock()
+    async def test_poll_until_timeout_chains_last_transient_error(
+        self, fake_clock, monkeypatch
+    ):
+        monkeypatch.setattr("gcsfs.poller._calculate_poll_delay", lambda elapsed: 0.5)
         last = api_exceptions.ServiceUnavailable("still down")
         check = mock.AsyncMock(
             side_effect=[api_exceptions.TooManyRequests("slow down"), last, last]
         )
 
         with pytest.raises(asyncio.TimeoutError) as exc_info:
-            await poll_until(
-                check,
-                delay_fn=lambda elapsed: 0.5,
-                timeout=1.2,
-                time_fn=clock.time,
-                sleep_fn=clock.sleep,
-            )
+            await poll_until(check, timeout=1.2)
 
         assert exc_info.value.__cause__ is last
 
     @pytest.mark.asyncio
-    async def test_poll_until_timeout_has_no_cause_after_successful_check(self):
-        clock = FakeVirtualClock()
+    async def test_poll_until_timeout_has_no_cause_after_successful_check(
+        self, fake_clock, monkeypatch
+    ):
+        monkeypatch.setattr("gcsfs.poller._calculate_poll_delay", lambda elapsed: 0.5)
         check = mock.AsyncMock(
             side_effect=[
                 api_exceptions.ServiceUnavailable("blip"),
@@ -328,33 +310,21 @@ class TestPollRunners:
         )
 
         with pytest.raises(asyncio.TimeoutError) as exc_info:
-            await poll_until(
-                check,
-                delay_fn=lambda elapsed: 0.5,
-                timeout=1.2,
-                time_fn=clock.time,
-                sleep_fn=clock.sleep,
-            )
+            await poll_until(check, timeout=1.2)
 
         assert exc_info.value.__cause__ is None
 
     @pytest.mark.asyncio
     async def test_poll_lro_timeout_raises_timeout_error_with_operation_id(
-        self, fake_lro, monkeypatch
+        self, fake_lro, fake_clock, monkeypatch
     ):
         monkeypatch.setattr("gcsfs.poller._calculate_poll_delay", linear_delay(0.5))
-        clock = FakeVirtualClock()
         lro = fake_lro.pending(name="projects/_/buckets/b/operations/op-stalled")
 
         with pytest.raises(asyncio.TimeoutError) as exc_info:
-            await poll_lro(
-                lro.op,
-                timeout=1.2,
-                time_fn=clock.time,
-                sleep_fn=clock.sleep,
-            )
+            await poll_lro(lro.op, timeout=1.2)
 
-        assert clock.now == pytest.approx(1.2)
+        assert fake_clock.now == pytest.approx(1.2)
         # Polls at 0.5 s, 1.0 s and 1.2 s; the message names the operation.
         assert lro.get_operation.await_count == 3
         assert str(exc_info.value) == (
@@ -364,25 +334,34 @@ class TestPollRunners:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "bad_timeout", [0, 0.0, -1.0, math.inf, math.nan, True, "300"]
+        "bad_timeout, error",
+        [
+            (0, ValueError),
+            (0.0, ValueError),
+            (-1.0, ValueError),
+            (math.nan, ValueError),
+            (None, TypeError),
+            ("300", TypeError),
+        ],
     )
     @pytest.mark.parametrize("done_at_t0", [True, False])
     async def test_poll_lro_rejects_invalid_timeout_before_any_rpc(
-        self, fake_lro, bad_timeout, done_at_t0
+        self, fake_lro, fake_clock, bad_timeout, error, done_at_t0
     ):
-        clock = FakeVirtualClock()
         lro = fake_lro.succeeded() if done_at_t0 else fake_lro.pending()
 
-        with pytest.raises(ValueError, match="timeout must be a positive finite"):
-            await poll_lro(
-                lro.op,
-                timeout=bad_timeout,
-                time_fn=clock.time,
-                sleep_fn=clock.sleep,
-            )
+        with pytest.raises(error):
+            await poll_lro(lro.op, timeout=bad_timeout)
 
         lro.get_operation.assert_not_awaited()
-        assert clock.sleeps == []
+        assert fake_clock.sleeps == []
+
+    @pytest.mark.asyncio
+    async def test_timeout_is_a_required_keyword(self, fake_lro):
+        with pytest.raises(TypeError, match="timeout"):
+            await poll_lro(fake_lro.pending().op)
+        with pytest.raises(TypeError, match="timeout"):
+            await poll_until(mock.AsyncMock(return_value=(True, "ok")))
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -426,10 +405,9 @@ class TestPollRunners:
 
     @pytest.mark.asyncio
     async def test_poll_lro_cancellation_dispatches_server_cancel(
-        self, fake_lro, caplog, monkeypatch
+        self, fake_lro, fake_clock, caplog, monkeypatch
     ):
         monkeypatch.setattr("gcsfs.poller._calculate_poll_delay", linear_delay(0.2))
-        clock = FakeVirtualClock()
         # The 1st poll is cancelled; the real AsyncOperation.cancel() then polls
         # once more (still pending) before sending CancelOperation.
         name = "projects/_/buckets/b/operations/op-cancel"
@@ -439,11 +417,7 @@ class TestPollRunners:
 
         with caplog.at_level("WARNING", logger="gcsfs"):
             with pytest.raises(asyncio.CancelledError):
-                await poll_lro(
-                    lro.op,
-                    time_fn=clock.time,
-                    sleep_fn=clock.sleep,
-                )
+                await poll_lro(lro.op, timeout=math.inf)
 
         await asyncio.gather(*list(_BACKGROUND_TASKS), return_exceptions=True)
         lro.cancel_operation.assert_awaited_once()
@@ -452,11 +426,10 @@ class TestPollRunners:
 
     @pytest.mark.asyncio
     async def test_poll_lro_cancellation_bounds_hung_server_cancel(
-        self, fake_lro, monkeypatch
+        self, fake_lro, fake_clock, monkeypatch
     ):
         monkeypatch.setattr("gcsfs.poller.PER_POLL_RPC_TIMEOUT", 0.01)
         monkeypatch.setattr("gcsfs.poller._calculate_poll_delay", linear_delay(0.2))
-        clock = FakeVirtualClock()
         name = "projects/_/buckets/b/operations/op-cancel-hung"
         lro = fake_lro.sequence(
             [asyncio.CancelledError(), operation_pb(name=name)], name=name
@@ -468,11 +441,7 @@ class TestPollRunners:
         lro.cancel_operation.side_effect = hung_cancel
 
         with pytest.raises(asyncio.CancelledError):
-            await poll_lro(
-                lro.op,
-                time_fn=clock.time,
-                sleep_fn=clock.sleep,
-            )
+            await poll_lro(lro.op, timeout=math.inf)
 
         await asyncio.wait_for(
             asyncio.gather(*list(_BACKGROUND_TASKS), return_exceptions=True),
@@ -482,7 +451,7 @@ class TestPollRunners:
 
     @pytest.mark.asyncio
     async def test_poll_lro_keeps_cancel_that_races_a_finished_status_check(
-        self, fake_lro, monkeypatch
+        self, fake_lro, fake_clock, monkeypatch
     ):
         """A cancel that lands in the same loop step as a status check finishing
         must still raise CancelledError and send CancelOperation.
@@ -491,7 +460,6 @@ class TestPollRunners:
         that case and drops the cancel, so polling would run on until timeout.
         """
         monkeypatch.setattr("gcsfs.poller._calculate_poll_delay", linear_delay(0.2))
-        clock = FakeVirtualClock()
         lro = fake_lro.pending(name="projects/_/buckets/b/operations/op-race")
         replay = lro.get_operation.side_effect
         tasks = {}
@@ -504,18 +472,12 @@ class TestPollRunners:
         async def sleep_and_yield(delay):
             # Yield like asyncio.sleep, so a cancel still pending on the
             # poller is delivered here, as it would be in production.
-            await clock.sleep(delay)
+            await fake_clock.sleep(delay)
             await asyncio.sleep(0)
 
+        monkeypatch.setattr("gcsfs.poller._sleep", sleep_and_yield)
         lro.get_operation.side_effect = cancel_poller_then_report_pending
-        tasks["poller"] = asyncio.create_task(
-            poll_lro(
-                lro.op,
-                timeout=1.0,
-                time_fn=clock.time,
-                sleep_fn=sleep_and_yield,
-            )
-        )
+        tasks["poller"] = asyncio.create_task(poll_lro(lro.op, timeout=1.0))
 
         with pytest.raises(asyncio.CancelledError):
             await tasks["poller"]
@@ -530,12 +492,13 @@ class TestPollRunners:
         lro.cancel_operation.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_poll_lro_retries_after_per_poll_timeout(self, fake_lro, monkeypatch):
+    async def test_poll_lro_retries_after_per_poll_timeout(
+        self, fake_lro, fake_clock, monkeypatch
+    ):
         """A status check that exceeds the per-poll deadline is cancelled and
         counts as a transient error, so the next poll runs."""
         monkeypatch.setattr("gcsfs.poller.PER_POLL_RPC_TIMEOUT", 0.05)
         monkeypatch.setattr("gcsfs.poller._calculate_poll_delay", linear_delay(0.2))
-        clock = FakeVirtualClock()
         lro = fake_lro.succeeded(after=1)
         replay = lro.get_operation.side_effect
         hung_check_cancelled = asyncio.Event()
@@ -551,47 +514,44 @@ class TestPollRunners:
 
         lro.get_operation.side_effect = first_check_hangs
 
-        await poll_lro(
-            lro.op,
-            timeout=10.0,
-            time_fn=clock.time,
-            sleep_fn=clock.sleep,
-        )
+        await poll_lro(lro.op, timeout=10.0)
 
         await asyncio.wait_for(hung_check_cancelled.wait(), timeout=5.0)
         assert lro.get_operation.await_count == 2
         # The timed-out check counts as a transient error, so the next sleep
         # is the first backoff step (0.5 s +-25%).
-        assert clock.sleeps[0] == pytest.approx(0.2)
-        assert 0.375 <= clock.sleeps[1] <= 0.625
+        assert fake_clock.sleeps[0] == pytest.approx(0.2)
+        assert 0.375 <= fake_clock.sleeps[1] <= 0.625
         lro.cancel_operation.assert_not_awaited()
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("bad_timeout", [0, -1.0, math.inf, math.nan, True])
-    async def test_poll_until_rejects_invalid_timeout(self, bad_timeout):
-        clock = FakeVirtualClock()
+    @pytest.mark.parametrize(
+        "bad_timeout, error",
+        [
+            (0, ValueError),
+            (-1.0, ValueError),
+            (math.nan, ValueError),
+            (None, TypeError),
+            ("300", TypeError),
+        ],
+    )
+    async def test_poll_until_rejects_invalid_timeout(self, bad_timeout, error):
         check = mock.AsyncMock(return_value=(True, "ok"))
 
-        with pytest.raises(ValueError, match="timeout must be a positive finite"):
-            await poll_until(
-                check, timeout=bad_timeout, time_fn=clock.time, sleep_fn=clock.sleep
-            )
+        with pytest.raises(error):
+            await poll_until(check, timeout=bad_timeout)
 
         check.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_poll_until_clamps_last_sleep_to_the_deadline(self):
-        clock = FakeVirtualClock()
+    async def test_poll_until_clamps_last_sleep_to_the_deadline(
+        self, fake_clock, monkeypatch
+    ):
+        monkeypatch.setattr("gcsfs.poller._calculate_poll_delay", lambda elapsed: 10.0)
         check = mock.AsyncMock(return_value=(False, None))
 
         with pytest.raises(asyncio.TimeoutError):
-            await poll_until(
-                check,
-                delay_fn=lambda elapsed: 10.0,
-                timeout=1.5,
-                time_fn=clock.time,
-                sleep_fn=clock.sleep,
-            )
+            await poll_until(check, timeout=1.5)
 
-        assert clock.sleeps == [1.5]
+        assert fake_clock.sleeps == [1.5]
         check.assert_awaited_once()

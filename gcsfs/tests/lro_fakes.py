@@ -12,6 +12,8 @@ GetOperation and CancelOperation transport calls are mocked::
 An ``AsyncOperation`` is bound to the event loop it was built on, so await it
 there: the factory builds on the running loop in async tests and on fsspec's IO
 loop (where sync ``gcsfs`` calls run) otherwise.
+
+``FakeClock`` runs ``gcsfs.poller``'s polling loop on virtual time.
 """
 
 import asyncio
@@ -276,3 +278,28 @@ class FakeLroFactory:
         return FakeLro(
             op=op, get_operation=get_operation, cancel_operation=cancel_operation
         )
+
+
+class FakeClock:
+    """Virtual clock for ``gcsfs.poller``: sleeps return at once and advance ``now``.
+
+    ``patch(monkeypatch)`` replaces ``gcsfs.poller._monotonic`` and
+    ``gcsfs.poller._sleep`` only. Never patch ``time.monotonic`` or
+    ``asyncio.sleep`` globally: the event loop itself uses them.
+    """
+
+    def __init__(self, start: float = 0.0):
+        self.now = start
+        self.sleeps: list[float] = []
+
+    def time(self) -> float:
+        return self.now
+
+    async def sleep(self, delay: float) -> None:
+        self.sleeps.append(delay)
+        self.now += delay
+
+    def patch(self, monkeypatch) -> "FakeClock":
+        monkeypatch.setattr("gcsfs.poller._monotonic", self.time)
+        monkeypatch.setattr("gcsfs.poller._sleep", self.sleep)
+        return self

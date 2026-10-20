@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import math
 import random
 import time
 from typing import Any, Awaitable, Callable, Optional, Tuple, TypeVar
@@ -19,24 +18,31 @@ _BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
 PER_POLL_RPC_TIMEOUT: float = 15.0
 #: Polls that finish after this many seconds log at INFO instead of DEBUG.
 SLOW_LRO_LOG_THRESHOLD: float = 2.0
+#: Delay before the next status check: _POLL_DELAY_SLOPE times the elapsed
+#: seconds, at least _POLL_DELAY_FLOOR and at most _POLL_DELAY_CAP after jitter.
+_POLL_DELAY_SLOPE: float = 0.20
+_POLL_DELAY_FLOOR: float = 0.2
+_POLL_DELAY_CAP: float = 30.0
+_POLL_DELAY_JITTER: Tuple[float, float] = (0.75, 1.25)
 #: After n consecutive transient errors, the next delay is at least
 #: min(base * 2 ** (n - 1), cap / 1.25), jittered by 0.75-1.25.
 _TRANSIENT_ERROR_BACKOFF_BASE: float = 0.5
 _TRANSIENT_ERROR_BACKOFF_CAP: float = 30.0
 
+# Clock and sleep used by the polling loop. Tests patch these two names, never
+# time.monotonic or asyncio.sleep, which the event loop itself uses.
+_monotonic = time.monotonic
+_sleep = asyncio.sleep
 
-def _calculate_poll_delay(
-    elapsed: float,
-    *,
-    slope: float = 0.20,
-    floor: float = 0.2,
-    cap: float = 30.0,
-    jitter: Tuple[float, float] = (0.75, 1.25),
-    random_fn: Callable[[float, float], float] = random.uniform,
-) -> float:
+
+def _calculate_poll_delay(elapsed: float) -> float:
     """Returns the jittered delay in seconds before the next status check."""
-    # Capping at cap / jitter[1] keeps the jittered delay at or below cap.
-    return min(max(elapsed * slope, floor), cap / jitter[1]) * random_fn(*jitter)
+    low, high = _POLL_DELAY_JITTER
+    # Capping at cap / high keeps the jittered delay at or below the cap.
+    delay = min(
+        max(elapsed * _POLL_DELAY_SLOPE, _POLL_DELAY_FLOOR), _POLL_DELAY_CAP / high
+    )
+    return delay * random.uniform(low, high)
 
 
 def _is_transient_poll_exception(exc: Exception) -> bool:
@@ -44,30 +50,11 @@ def _is_transient_poll_exception(exc: Exception) -> bool:
     return isinstance(exc, asyncio.TimeoutError) or is_transient_exception(exc)
 
 
-def _validate_lro_timeout(timeout: Optional[float]) -> None:
-    """Raises ValueError unless timeout is None or a positive finite number."""
-    if timeout is None:
-        return
-    if (
-        isinstance(timeout, bool)
-        or not isinstance(timeout, (int, float))
-        or not math.isfinite(timeout)
-        or timeout <= 0
-    ):
-        raise ValueError(
-            "timeout must be a positive finite number of seconds, or None for "
-            f"no limit; got {timeout!r}"
-        )
-
-
 async def poll_until(
     check_fn: Callable[[], Awaitable[Tuple[bool, T]]],
     *,
-    delay_fn: Callable[[float], float] = _calculate_poll_delay,
-    timeout: Optional[float] = None,
-    operation_id: Optional[str] = None,
-    time_fn: Callable[[], float] = time.monotonic,
-    sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    timeout: float,
+    description: Optional[str] = None,
 ) -> T:
     """Sleeps, then calls ``check_fn``, until it reports done or ``timeout`` passes.
 
@@ -75,29 +62,30 @@ async def poll_until(
         check_fn: Async callable returning ``(is_done, result)``. Transient
             errors are retried on the next poll, with an exponential backoff
             while they repeat; other errors are raised.
-        delay_fn: Maps the elapsed seconds to the delay before the next check.
-        timeout: Overall limit in seconds, or ``None`` for no limit.
-        operation_id: Name used in log and error messages.
-        time_fn: Monotonic clock, in seconds.
-        sleep_fn: Async sleep, in seconds.
+        timeout: Overall limit in seconds; use ``math.inf`` for no limit.
+        description: Name used in log and error messages.
 
     Raises:
-        ValueError: If ``timeout`` is not ``None`` or a positive finite number.
+        ValueError: If ``timeout`` is not a positive number.
         asyncio.TimeoutError: If ``timeout`` passes first. If the last check
             failed with a transient error, it is chained as ``__cause__``.
     """
-    _validate_lro_timeout(timeout)
-    start_time = time_fn()
-    op_desc = f" for '{operation_id}'" if operation_id else ""
+    if not timeout > 0:
+        raise ValueError(
+            "timeout must be a positive number of seconds, or math.inf for no "
+            f"limit; got {timeout!r}"
+        )
+    start_time = _monotonic()
+    op_desc = f" for '{description}'" if description else ""
     logger.debug("Starting polling%s...", op_desc)
 
     attempts = 1
     transient_errors = 0
     last_exc: Optional[Exception] = None
     while True:
-        elapsed = time_fn() - start_time
-        remaining = None if timeout is None else timeout - elapsed
-        if remaining is not None and remaining <= 0:
+        elapsed = _monotonic() - start_time
+        remaining = timeout - elapsed
+        if remaining <= 0:
             checks = attempts - 1
             checks_desc = f"{checks} status check{'' if checks == 1 else 's'}"
             logger.warning(
@@ -110,7 +98,7 @@ async def poll_until(
                 f"Polling timed out{op_desc} after {elapsed:.2f}s and {checks_desc}."
             ) from last_exc
 
-        delay = delay_fn(elapsed)
+        delay = _calculate_poll_delay(elapsed)
         if transient_errors:
             # The exponent is bounded so a long outage can't overflow a float.
             backoff = min(
@@ -118,8 +106,7 @@ async def poll_until(
                 _TRANSIENT_ERROR_BACKOFF_CAP / 1.25,
             )
             delay = max(delay, backoff * random.uniform(0.75, 1.25))
-        if remaining is not None:
-            delay = min(delay, remaining)
+        delay = min(delay, remaining)
         logger.debug(
             "Poll attempt #%d%s: elapsed=%.3fs, sleeping %.3fs before check",
             attempts,
@@ -127,14 +114,14 @@ async def poll_until(
             elapsed,
             delay,
         )
-        await sleep_fn(delay)
+        await _sleep(delay)
 
         try:
             is_done, result = await check_fn()
             last_exc = None
             transient_errors = 0
             if is_done:
-                final_elapsed = time_fn() - start_time
+                final_elapsed = _monotonic() - start_time
                 log_level = (
                     logging.INFO
                     if final_elapsed >= SLOW_LRO_LOG_THRESHOLD
@@ -215,29 +202,25 @@ async def _wait_keeping_cancel(aw: Awaitable[T], timeout: float) -> T:
     return task.result()
 
 
-async def poll_lro(
-    operation: AsyncOperation,
-    *,
-    timeout: Optional[float] = None,
-    time_fn: Callable[[], float] = time.monotonic,
-    sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
-) -> Any:
+async def poll_lro(operation: AsyncOperation, *, timeout: float) -> Any:
     """Waits for a GAPIC ``AsyncOperation`` to finish and returns its result.
 
     Args:
         operation: The operation to wait for.
-        timeout: Overall limit in seconds, or ``None`` for no limit.
-        time_fn: Monotonic clock, in seconds.
-        sleep_fn: Async sleep, in seconds.
+        timeout: Overall limit in seconds; use ``math.inf`` for no limit.
 
     Raises:
-        ValueError: If ``timeout`` is not ``None`` or a positive finite number.
+        ValueError: If ``timeout`` is not a positive number.
         asyncio.TimeoutError: If ``timeout`` passes before the operation ends.
         asyncio.CancelledError: If cancelled; ``operation.cancel()`` is then
             sent in the background.
         google.api_core.exceptions.GoogleAPICallError: If the operation failed.
     """
-    _validate_lro_timeout(timeout)
+    if not timeout > 0:
+        raise ValueError(
+            "timeout must be a positive number of seconds, or math.inf for no "
+            f"limit; got {timeout!r}"
+        )
 
     op_id = operation.operation.name or "LRO"
 
@@ -248,14 +231,10 @@ async def poll_lro(
         )
         return await unwrap_operation_result(operation)
 
-    start_time = time_fn()
+    start_time = _monotonic()
 
     async def lro_complete() -> Tuple[bool, None]:
-        remaining_budget = (
-            max(0.0, timeout - (time_fn() - start_time))
-            if timeout is not None
-            else PER_POLL_RPC_TIMEOUT
-        )
+        remaining_budget = max(0.0, timeout - (_monotonic() - start_time))
         rpc_timeout = min(PER_POLL_RPC_TIMEOUT, max(1.0, remaining_budget))
 
         # retry=None: the GAPIC default retry would add a second, slower retry
@@ -268,17 +247,9 @@ async def poll_lro(
         return bool(is_done), None
 
     try:
-        await poll_until(
-            lro_complete,
-            # Looked up at call time so tests can patch the cadence.
-            delay_fn=_calculate_poll_delay,
-            timeout=timeout,
-            operation_id=op_id,
-            time_fn=time_fn,
-            sleep_fn=sleep_fn,
-        )
+        await poll_until(lro_complete, timeout=timeout, description=op_id)
     except asyncio.CancelledError:
-        elapsed = time_fn() - start_time
+        elapsed = _monotonic() - start_time
         logger.warning(
             "LRO %s polling cancelled after %.3fs; "
             "dispatching server-side cancellation signal.",
