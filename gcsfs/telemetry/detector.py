@@ -335,6 +335,7 @@ class EnvironmentDetector(BaseDetector):
                 verdict = self._local_fallback_verdict()
             resolved = True
         except GeneratorExit:
+            # close() can run from GC while this thread holds self._lock.
             closed_by_loop_teardown = True
             raise
         except Exception:
