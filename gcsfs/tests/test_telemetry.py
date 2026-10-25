@@ -1718,6 +1718,17 @@ def test_task_on_stopped_unclosed_loop_is_rescheduled(fake_host):
     assert resolved == "gce"
 
 
+def test_future_on_stopped_fsspec_loop_is_rescheduled(fake_host):
+    fake_host.product_name = "Google Compute Engine"
+    detector = EnvironmentDetector()
+
+    detector._probe_in_flight = True
+    detector._probe_future = concurrent.futures.Future()
+
+    with _fsspec_loop_unset():
+        assert detector._probe_handle_is_stale() is True
+
+
 def test_exhausted_no_gce_check_skips_local_signals_on_later_calls(
     fake_host, monkeypatch
 ):

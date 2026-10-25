@@ -325,7 +325,13 @@ class EnvironmentDetector(BaseDetector):
                 or not task_loop.is_running()
             )
         if self._probe_future is not None:
-            return self._probe_future.done()
+            fsspec_loop = fsspec.asyn.loop[0]
+            return (
+                self._probe_future.done()
+                or fsspec_loop is None
+                or fsspec_loop.is_closed()
+                or not fsspec_loop.is_running()
+            )
         return True
 
     def _schedule_probe(self) -> None:
