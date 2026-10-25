@@ -59,8 +59,7 @@ def _read_linux_product_name() -> Optional[str]:
         return None
 
 
-async def _backoff_sleep(delay: float) -> None:
-    await asyncio.sleep(delay)
+_backoff_sleep = asyncio.sleep
 
 
 def _new_probe_session() -> aiohttp.ClientSession:
