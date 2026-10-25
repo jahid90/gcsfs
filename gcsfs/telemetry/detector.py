@@ -22,7 +22,6 @@ ENV_OTHER = "oth"
 _TRUTHY_VALUES = ("1", "true", "yes")
 _GCP_PRODUCT_NAMES = ("Google", "Google Compute Engine")
 _DMI_PRODUCT_NAME_PATH = "/sys/class/dmi/id/product_name"
-_WINDOWS_HARDWARE_CONFIG_KEY = r"SYSTEM\HardwareConfig\Current"
 _K8S_SERVICE_ACCOUNT_PATH = "/var/run/secrets/kubernetes.io/serviceaccount"
 _METADATA_HOST_ENV_VARS = ("GCE_METADATA_HOST", "GCE_METADATA_ROOT", "GCE_METADATA_IP")
 _DEFAULT_METADATA_HOST = "169.254.169.254"
@@ -58,19 +57,6 @@ def _read_linux_product_name() -> Optional[str]:
             return f.read()
     except OSError:
         return None
-
-
-def _read_windows_product_name() -> Optional[str]:
-    try:
-        import winreg
-
-        with winreg.OpenKey(
-            winreg.HKEY_LOCAL_MACHINE, _WINDOWS_HARDWARE_CONFIG_KEY
-        ) as key:
-            product_name, _ = winreg.QueryValueEx(key, "SystemProductName")
-    except (ImportError, OSError):
-        return None
-    return product_name if isinstance(product_name, str) else None
 
 
 async def _backoff_sleep(delay: float) -> None:
@@ -109,12 +95,6 @@ class BaseDetector:
         Optional[str]: Bare token value (e.g. 'pandas') or None if not detected.
         """
         raise NotImplementedError
-
-    def is_enabled(self) -> bool:
-        """Check if telemetry opt-out environment variable is active."""
-        return not any(
-            _env_flag_enabled(env) for env in ("DO_NOT_TRACK", "GCSFS_NO_TELEMETRY")
-        )
 
 
 class FrameworkDetector(BaseDetector):
@@ -218,9 +198,6 @@ class EnvironmentDetector(BaseDetector):
         _live_detectors.add(self)
 
     def detect(self) -> Optional[str]:
-        if not self.is_enabled():
-            return None
-
         cached_env = self._cached_env
         if cached_env is not None:
             return cached_env
@@ -239,17 +216,6 @@ class EnvironmentDetector(BaseDetector):
 
         self._schedule_probe()
         return None
-
-    def reset_cache(self) -> None:
-        """Forget any resolved verdict and in-flight probe so detection reruns."""
-        with self._lock:
-            self._cached_env = None
-            self._probe_exhausted = False
-            self._probe_in_flight = False
-            self._probe_task = None
-            self._probe_future = None
-            self._probe_generation += 1
-            self._gcp_bios = None
 
     def _reset_after_fork(self) -> None:
         self._lock = threading.Lock()
@@ -287,12 +253,9 @@ class EnvironmentDetector(BaseDetector):
 
     @staticmethod
     def _read_gcp_bios() -> bool:
-        if sys.platform.startswith("linux"):
-            product_name = _read_linux_product_name()
-        elif sys.platform == "win32":
-            product_name = _read_windows_product_name()
-        else:
+        if not sys.platform.startswith("linux"):
             return False
+        product_name = _read_linux_product_name()
         return product_name is not None and product_name.strip() in _GCP_PRODUCT_NAMES
 
     def _local_fallback_verdict(self) -> Optional[str]:
