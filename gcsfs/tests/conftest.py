@@ -125,6 +125,16 @@ def _avoid_adc_timeout(monkeypatch):
 
 
 @pytest.fixture(scope="session", autouse=True)
+def _stub_environment_detection():
+    """Keep host-specific env/ tokens and metadata server probes out of tests."""
+    from gcsfs.tests.utils import stub_environment_detection
+
+    with pytest.MonkeyPatch.context() as mp:
+        stub_environment_detection(mp)
+        yield
+
+
+@pytest.fixture(scope="session", autouse=True)
 def _mock_get_bucket_type_on_emulator():
     """Mock _get_bucket_type to return UNKNOWN instantly on emulator."""
     from gcsfs.tests.utils import _patch_get_bucket_type_for_emulator

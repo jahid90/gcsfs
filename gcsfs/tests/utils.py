@@ -69,3 +69,10 @@ def _patch_get_bucket_type_for_emulator():
         "gcsfs.extended_gcsfs.ExtendedGcsFileSystem._get_bucket_type",
         return_value=BucketType.UNKNOWN,
     )
+
+
+def stub_environment_detection(monkeypatch):
+    """Stub EnvironmentDetector.detect to report no env/ token (usable without conftest)."""
+    from gcsfs.telemetry.detector import EnvironmentDetector
+
+    monkeypatch.setattr(EnvironmentDetector, "detect", lambda self: None)
