@@ -16,8 +16,6 @@ _BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
 
 #: Deadline for a single operation.done() status check, in seconds.
 PER_POLL_RPC_TIMEOUT: float = 15.0
-#: Default overall timeout in seconds for HNS folder rename LROs.
-DEFAULT_HNS_LRO_TIMEOUT: float = 300.0
 #: Polls that finish after this many seconds log at INFO instead of DEBUG.
 SLOW_LRO_LOG_THRESHOLD: float = 2.0
 _POLL_DELAY_SLOPE: float = 0.20
@@ -174,11 +172,6 @@ async def unwrap_operation_result(operation: AsyncOperation) -> Any:
         raise
 
 
-def _get_operation_name(operation: AsyncOperation) -> Optional[str]:
-    """Returns the server-side operation name, or ``None`` if empty."""
-    return operation.operation.name or None
-
-
 def _retrieve_task_outcome(task: "asyncio.Future[Any]") -> None:
     """Reads an abandoned task's outcome so asyncio does not log it as unretrieved."""
     if not task.cancelled():
@@ -205,22 +198,12 @@ async def _wait_keeping_cancel(aw: Awaitable[T], timeout: float) -> T:
     return task.result()
 
 
-async def poll_lro(
-    operation: AsyncOperation,
-    *,
-    timeout: float,
-    path1: Optional[str] = None,
-    path2: Optional[str] = None,
-    request_id: Optional[str] = None,
-) -> Any:
+async def poll_lro(operation: AsyncOperation, *, timeout: float) -> Any:
     """Waits for a GAPIC ``AsyncOperation`` to finish and returns its result.
 
     Args:
         operation: The operation to wait for.
         timeout: Overall limit in seconds; use ``math.inf`` for no limit.
-        path1: Optional source path for diagnostic logging context.
-        path2: Optional destination path for diagnostic logging context.
-        request_id: Optional fallback identifier when the operation has no name.
 
     Raises:
         ValueError: If ``timeout`` is not a positive number.
@@ -235,13 +218,12 @@ async def poll_lro(
             f"limit; got {timeout!r}"
         )
 
-    op_id = _get_operation_name(operation) or request_id or "LRO"
-    path_ctx = f"'{path1}' -> '{path2}'" if path1 and path2 else op_id
+    op_id = operation.operation.name or "LRO"
 
     if operation.operation.done:
         logger.debug(
             "LRO %s completed synchronously in memory at t=0; skipping polling.",
-            path_ctx,
+            op_id,
         )
         return await unwrap_operation_result(operation)
 
