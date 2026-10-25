@@ -44,7 +44,7 @@ _SERVERLESS_ENV_VARS = (
     "GAE_INSTANCE",
     "GAE_ENV",
 )
-_PROBE_TRANSIENT_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError, OSError)
+_PROBE_TRANSIENT_ERRORS = (aiohttp.ClientConnectionError, asyncio.TimeoutError)
 
 
 def _env_flag_enabled(name: str) -> bool:
