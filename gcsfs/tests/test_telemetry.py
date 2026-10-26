@@ -861,6 +861,22 @@ def _connector_error():
     )
 
 
+def _fake_winreg(product_name):
+    def open_key(root, sub_key):
+        if isinstance(product_name, BaseException):
+            raise product_name
+        return contextlib.nullcontext((root, sub_key))
+
+    def query_value_ex(key, value_name):
+        return product_name, 1
+
+    return types.SimpleNamespace(
+        HKEY_LOCAL_MACHINE="HKEY_LOCAL_MACHINE",
+        OpenKey=open_key,
+        QueryValueEx=query_value_ex,
+    )
+
+
 def _wait_until_probe_settles(detector: EnvironmentDetector, timeout: float = 5.0):
     deadline = time.monotonic() + timeout
     while detector._probe_in_flight:
@@ -1334,3 +1350,31 @@ def test_module_fork_hook_resets_live_detectors(fake_host):
     assert detector._cached_env == "gce"
     assert detector._probe_in_flight is False
     assert detector._probe_future is None
+
+
+@pytest.mark.asyncio
+async def test_windows_gce_vm_probes_and_resolves_gce(fake_host, monkeypatch):
+    monkeypatch.setattr(environment_module.sys, "platform", "win32")
+    monkeypatch.setitem(sys.modules, "winreg", _fake_winreg("Google Compute Engine "))
+    fake_host.outcomes = [_mds_response(404)]
+    detector = EnvironmentDetector()
+
+    detector.detect()
+    await _settle_probe(detector)
+    detected = detector.detect()
+
+    assert detected == "gce"
+    assert fake_host.dmi_reads == []
+
+
+def test_windows_without_registry_key_is_oth(fake_host, monkeypatch):
+    monkeypatch.setattr(environment_module.sys, "platform", "win32")
+    monkeypatch.setitem(
+        sys.modules, "winreg", _fake_winreg(FileNotFoundError("missing key"))
+    )
+    detector = EnvironmentDetector()
+
+    detected = detector.detect()
+
+    assert detected == "oth"
+    assert fake_host.opened_sessions == 0
