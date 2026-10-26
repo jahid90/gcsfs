@@ -127,10 +127,10 @@ def _avoid_adc_timeout(monkeypatch):
 @pytest.fixture(scope="session", autouse=True)
 def _stub_environment_detection():
     """Keep host-specific env/ tokens and metadata server probes out of tests."""
-    from gcsfs.tests.utils import stub_environment_detection
+    from gcsfs.telemetry.detector import EnvironmentDetector
 
     with pytest.MonkeyPatch.context() as mp:
-        stub_environment_detection(mp)
+        mp.setattr(EnvironmentDetector, "detect", lambda self: None)
         yield
 
 
