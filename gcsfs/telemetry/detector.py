@@ -300,28 +300,21 @@ class EnvironmentDetector(BaseDetector):
             self._probe_generation += 1
             probe = self._probe_coro(self._probe_generation)
             try:
-                try:
-                    running_loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    running_loop = None
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
 
-                fsspec_loop = fsspec.asyn.loop[0]
-                if running_loop is not None and (
-                    fsspec_loop is None or running_loop is fsspec_loop
-                ):
-                    self._probe_task = running_loop.create_task(probe)
-                    self._probe_future = None
-                else:
-                    self._probe_future = asyncio.run_coroutine_threadsafe(
-                        probe, fsspec.asyn.get_loop()
-                    )
-                    self._probe_task = None
-            except Exception:
-                probe.close()
-                self._probe_in_flight = False
-                self._probe_task = None
+            fsspec_loop = fsspec.asyn.loop[0]
+            if running_loop is not None and (
+                fsspec_loop is None or running_loop is fsspec_loop
+            ):
+                self._probe_task = running_loop.create_task(probe)
                 self._probe_future = None
-                raise
+            else:
+                self._probe_future = asyncio.run_coroutine_threadsafe(
+                    probe, fsspec.asyn.get_loop()
+                )
+                self._probe_task = None
             self._probe_in_flight = True
 
     async def _probe_coro(self, generation: int) -> None:
