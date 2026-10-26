@@ -44,7 +44,8 @@ _SERVERLESS_ENV_VARS = (
     "GAE_INSTANCE",
     "GAE_ENV",
 )
-_PROBE_TRANSIENT_ERRORS = (aiohttp.ClientConnectionError, asyncio.TimeoutError)
+# Only errors time can fix; others hit _probe_coro's local fallback at once.
+_PROBE_RETRYABLE_ERRORS = (aiohttp.ClientConnectionError, asyncio.TimeoutError)
 
 
 def _env_flag_enabled(name: str) -> bool:
@@ -327,7 +328,7 @@ class EnvironmentDetector(BaseDetector):
                 verdict = self._local_fallback_verdict()
             resolved = True
         except GeneratorExit:
-            # close() can run from GC while this thread holds self._lock.
+            # GC can close() us under self._lock; locking here would deadlock.
             closed_by_loop_teardown = True
             raise
         except Exception:
@@ -372,5 +373,5 @@ class EnvironmentDetector(BaseDetector):
                     if response.status == 404:
                         return ENV_GCE
                     return None
-        except _PROBE_TRANSIENT_ERRORS:
+        except _PROBE_RETRYABLE_ERRORS:
             return None
