@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import os
 import sys
@@ -14,8 +15,10 @@ import pytest
 
 import gcsfs.telemetry.manager as manager_mod
 from gcsfs.telemetry.context import (
+    USER_AGENT_DIMENSIONS,
     Dimension,
     get_telemetry_context,
+    has_telemetry_context,
     reset_telemetry_context,
     sanitize_token,
     set_telemetry_context,
@@ -732,6 +735,89 @@ def test_sync_wrapper_propagates_context_to_background_loop_thread(detector):
     # Detection ran once, on the caller thread: the loop thread's stack has no framework frames
     assert detector.calls == [caller_thread_id]
     assert get_telemetry_context() == {}
+
+
+@contextlib.contextmanager
+def _scoped_ctx(tokens, value=None):
+    token = set_telemetry_context(tokens, value)
+    try:
+        yield
+    finally:
+        reset_telemetry_context(token)
+
+
+def test_user_agent_excludes_method_and_respects_opt_out(detector, monkeypatch):
+    """Verify User-Agent filters to fw/ and env/, get_tokens() defaults to all, and opt-out holds."""
+    from gcsfs.core import _build_user_agent
+
+    tracker = UsageMetricsTracker()
+    with _scoped_ctx(
+        {
+            Dimension.FRAMEWORK.value: "pandas",
+            Dimension.ENVIRONMENT.value: "gke",
+            Dimension.METHOD.value: "find",
+        }
+    ):
+        assert has_telemetry_context(Dimension.METHOD)
+        assert tracker.get_tokens(USER_AGENT_DIMENSIONS) == ["fw/pandas", "env/gke"]
+        assert tracker.get_tokens() == ["fw/pandas", "env/gke", "m/find"]
+        assert tracker.collect_tokens_map(USER_AGENT_DIMENSIONS) == {
+            "fw": "pandas",
+            "env": "gke",
+        }
+        assert tracker.get_dimension(Dimension.METHOD) == "find"
+        ua = _build_user_agent()
+        assert "fw/pandas" in ua and "env/gke" in ua and "m/find" not in ua
+
+        for env_var, env_val in (
+            ("DO_NOT_TRACK", "1"),
+            ("DO_NOT_TRACK", " TRUE "),
+            ("GCSFS_NO_TELEMETRY", "yes"),
+        ):
+            with monkeypatch.context() as mp:
+                mp.setenv(env_var, env_val)
+                assert tracker.get_tokens(USER_AGENT_DIMENSIONS) == []
+                assert tracker.get_tokens() == []
+                assert tracker.get_dimension(Dimension.METHOD) is None
+                assert tracker.collect_tokens_map() == {}
+
+    class _CustomAppDetector(BaseDetector):
+        name = "app"
+
+        def detect(self):
+            return "myapp"
+
+    custom_tracker = UsageMetricsTracker(detectors=[_CustomAppDetector()])
+    with _scoped_ctx({Dimension.FRAMEWORK: "jax", "region": "us"}):
+        assert custom_tracker.get_tokens(USER_AGENT_DIMENSIONS) == ["fw/jax"]
+        assert custom_tracker.get_tokens() == [
+            "fw/jax",
+            "region/us",
+            "app/myapp",
+        ]
+        assert custom_tracker.collect_tokens_map() == {
+            "fw": "jax",
+            "region": "us",
+            "app": "myapp",
+        }
+
+    # Dimension-filtered queries skip unrelated detectors.
+    env_calls = 0
+
+    class _CountingEnvDetector(BaseDetector):
+        @property
+        def name(self):
+            return Dimension.ENVIRONMENT
+
+        def detect(self):
+            nonlocal env_calls
+            env_calls += 1
+            return None
+
+    multi_tracker = UsageMetricsTracker(detectors=[detector, _CountingEnvDetector()])
+    assert multi_tracker.get_dimension(Dimension.FRAMEWORK) == "pandas"
+    assert len(detector.calls) == 1
+    assert env_calls == 0
 
 
 # ============================================================================
