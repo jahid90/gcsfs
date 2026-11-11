@@ -83,6 +83,28 @@ _UNTRACKED_COMPOSITE_METHODS = frozenset(
     }
 )
 
+_METHOD_TRACKED_PARAMS: Dict[str, frozenset[str]] = {
+    "cat": frozenset({"recursive"}),
+    "copy": frozenset({"recursive"}),
+    "cp": frozenset({"recursive"}),
+    "disk_usage": frozenset({"prefix", "withdirs"}),
+    "du": frozenset({"prefix", "withdirs"}),
+    "expand_path": frozenset({"recursive"}),
+    "find": frozenset({"detail", "prefix", "withdirs"}),
+    "get": frozenset({"recursive"}),
+    "glob": frozenset({"detail", "withdirs"}),
+    "ls": frozenset({"detail", "prefix"}),
+    "move": frozenset({"recursive"}),
+    "mv": frozenset({"recursive"}),
+    "open": frozenset({"cache_options"}),
+    "open_async": frozenset({"cache_options"}),
+    "put": frozenset({"recursive"}),
+    "read_text": frozenset({"cache_options"}),
+    "rm": frozenset({"recursive"}),
+    "walk": frozenset({"detail", "prefix"}),
+    "write_text": frozenset({"cache_options"}),
+}
+
 
 def _tracked_method_name(func: Callable) -> Optional[str]:
     """Return the tracked public method name for `func`, or None if untracked."""
@@ -91,6 +113,101 @@ def _tracked_method_name(func: Callable) -> Optional[str]:
         return _SYNC_ALIAS_METHODS[raw_name]
     name = raw_name.removeprefix("_")
     return name if name in _TRACKED_METHODS else None
+
+
+@functools.lru_cache(maxsize=256)
+def _cached_positional_spec(
+    raw_fn: Callable, method_name: str
+) -> tuple[tuple[int, str], ...]:
+    """Cache `(arg_index, param_name)` pairs on unbound functions so instances are never retained."""
+    allowed = _METHOD_TRACKED_PARAMS.get(method_name)
+    if not allowed:
+        return ()
+    try:
+        params = list(inspect.signature(raw_fn).parameters.values())
+    except (TypeError, ValueError):
+        return ()
+    return tuple(
+        (idx, p.name)
+        for idx, p in enumerate(params)
+        if p.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+        and p.name in allowed
+    )
+
+
+def _positional_tracked_params(
+    func: Callable, method_name: Optional[str]
+) -> tuple[tuple[int, str], ...]:
+    """Return `(arg_index, param_name)` pairs for tracked positional parameters on `func`."""
+    if not method_name or method_name not in _METHOD_TRACKED_PARAMS:
+        return ()
+    unwrapped = inspect.unwrap(func, stop=lambda f: isinstance(f, types.MethodType))
+    is_bound = isinstance(unwrapped, types.MethodType)
+    raw_fn = inspect.unwrap(unwrapped.__func__) if is_bound else unwrapped
+    try:
+        spec = _cached_positional_spec(raw_fn, method_name)
+    except TypeError:
+        spec = _cached_positional_spec.__wrapped__(raw_fn, method_name)
+    if is_bound:
+        return tuple((idx - 1, name) for idx, name in spec if idx >= 1)
+    return spec
+
+
+def _is_truthy_param(val: Any) -> bool:
+    try:
+        return bool(val)
+    except Exception:
+        return False
+
+
+def _extract_method_params(
+    pos_spec: tuple[tuple[int, str], ...],
+    args: tuple,
+    kwargs: dict,
+    method_name: Optional[str],
+) -> str:
+    """Extract sorted `.`-joined tracked parameter names enabled (truthy) on the call."""
+    allowed = _METHOD_TRACKED_PARAMS.get(method_name or "")
+    if not allowed:
+        return ""
+    found = set()
+    n_args = len(args)
+    for idx, name in pos_spec:
+        if idx < n_args and _is_truthy_param(args[idx]):
+            found.add(name)
+    if kwargs:
+        for name in allowed:
+            if name in kwargs and _is_truthy_param(kwargs[name]):
+                found.add(name)
+    return ".".join(sorted(found)) if found else ""
+
+
+def _collect_call_tokens(
+    func: Callable,
+    call_args: tuple,
+    kwargs: dict,
+    method_name: Optional[str],
+    pos_spec: Optional[tuple[tuple[int, str], ...]] = None,
+) -> Dict[str, str]:
+    """Collect outermost call telemetry, skipping param evaluation when disabled."""
+    if not manager.default_usage_tracker.is_enabled():
+        return {}
+    if method_name and method_name in _METHOD_TRACKED_PARAMS:
+        spec = (
+            pos_spec
+            if pos_spec is not None
+            else _positional_tracked_params(func, method_name)
+        )
+        params_str = _extract_method_params(spec, call_args, kwargs, method_name)
+    else:
+        params_str = ""
+    return manager.default_usage_tracker.collect_tokens_map(
+        method=method_name or "", method_params=params_str
+    )
 
 
 def _resolve_super_method(
@@ -118,7 +235,7 @@ def _telemetry_context(tokens_map: Optional[Dict[str, str]]):
 
 def _disabled_tokens_map() -> Dict[str, str]:
     """Return negative-cache sentinels for all dimensions and registered detectors."""
-    out = {d.value: "" for d in ALL_DIMENSIONS}
+    out = {d.value: "" for d in ALL_DIMENSIONS if d is not Dimension.METHOD_PARAMS}
     for det in manager.default_usage_tracker.detectors:
         key = det.name.value if isinstance(det.name, Dimension) else str(det.name)
         out[key] = ""
@@ -155,14 +272,13 @@ def with_telemetry_context(func: Callable) -> Callable:
     any requests issued underneath (including via `asyn.sync` to the loop thread) carry it.
     """
     method_name = _tracked_method_name(func)
+    pos_spec = _positional_tracked_params(func, method_name)
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         if has_telemetry_context(Dimension.METHOD):
             return func(*args, **kwargs)
-        tokens_map = manager.default_usage_tracker.collect_tokens_map(
-            method=method_name or ""
-        )
+        tokens_map = _collect_call_tokens(func, args, kwargs, method_name, pos_spec)
         with _telemetry_context(tokens_map):
             return func(*args, **kwargs)
 
@@ -183,9 +299,7 @@ def _run_sync(
         if has_telemetry_context(Dimension.METHOD):
             return fsspec.asyn.sync(loop, func, *args, **kwargs)
         resolved_method = _tracked_method_name(func)
-        tokens_map = manager.default_usage_tracker.collect_tokens_map(
-            method=resolved_method or ""
-        )
+        tokens_map = _collect_call_tokens(func, args, kwargs, resolved_method)
     with _telemetry_context(tokens_map):
         return fsspec.asyn.sync(loop, func, *args, **kwargs)
 
@@ -215,9 +329,7 @@ def _gcs_async_wrapper(
             tokens_map = (
                 get_telemetry_context()
                 if has_telemetry_context(Dimension.METHOD)
-                else manager.default_usage_tracker.collect_tokens_map(
-                    method=method_name or ""
-                )
+                else _collect_call_tokens(target, pass_args, kwargs, method_name)
             )
             gen = target(*pass_args, **kwargs)
             try:
@@ -241,9 +353,7 @@ def _gcs_async_wrapper(
         # O(1) fast path for nested calls (already inside _run_sync or another wrapped call)
         if has_telemetry_context(Dimension.METHOD):
             return await target(*pass_args, **kwargs)
-        tokens_map = manager.default_usage_tracker.collect_tokens_map(
-            method=method_name or ""
-        )
+        tokens_map = _collect_call_tokens(target, pass_args, kwargs, method_name)
         with _telemetry_context(tokens_map):
             return await target(*pass_args, **kwargs)
 
@@ -285,9 +395,7 @@ def _gcs_sync_wrapper(
             tokens_map = (
                 get_telemetry_context()
                 if has_telemetry_context(Dimension.METHOD)
-                else manager.default_usage_tracker.collect_tokens_map(
-                    method=method_name or ""
-                )
+                else _collect_call_tokens(actual_func, pass_args, kwargs, method_name)
             )
             gen = actual_func(*pass_args, **kwargs)
             try:
@@ -312,9 +420,7 @@ def _gcs_sync_wrapper(
             tokens_map = (
                 None
                 if has_telemetry_context(Dimension.METHOD)
-                else manager.default_usage_tracker.collect_tokens_map(
-                    method=method_name or ""
-                )
+                else _collect_call_tokens(actual_func, pass_args, kwargs, method_name)
             )
             return _run_sync(
                 self.loop,
@@ -338,9 +444,7 @@ def _gcs_sync_wrapper(
                 return target(*pass_args, **kwargs)
         if has_telemetry_context(Dimension.METHOD):
             return target(*pass_args, **kwargs)
-        tokens_map = manager.default_usage_tracker.collect_tokens_map(
-            method=method_name or ""
-        )
+        tokens_map = _collect_call_tokens(target, pass_args, kwargs, method_name)
         with _telemetry_context(tokens_map):
             return target(*pass_args, **kwargs)
 
@@ -514,9 +618,13 @@ def _setup_file_telemetry(file_obj) -> Optional[Any]:
     current = get_telemetry_context()
     if getattr(file_obj, "_telemetry_disabled", False):
         disabled_map = _disabled_tokens_map()
-        if all(current.get(k) == "" for k in disabled_map):
+        if (
+            all(current.get(k) == "" for k in disabled_map)
+            and Dimension.METHOD_PARAMS.value not in current
+        ):
             return None
         current.update(disabled_map)
+        current.pop(Dimension.METHOD_PARAMS.value, None)
         return set_telemetry_context(current)
 
     fw = getattr(file_obj, "caller_framework", None)
@@ -533,15 +641,20 @@ def _setup_file_telemetry(file_obj) -> Optional[Any]:
         method = "open"
 
     # Fast path: telemetry already active (e.g. nested file method calls), skip a redundant set/reset
-    if (not has_fw or current.get(Dimension.FRAMEWORK.value) == fw) and (
-        Dimension.METHOD.value in current
-        and current.get(Dimension.METHOD.value) == method
+    if (
+        (not has_fw or current.get(Dimension.FRAMEWORK.value) == fw)
+        and (
+            Dimension.METHOD.value in current
+            and current.get(Dimension.METHOD.value) == method
+        )
+        and Dimension.METHOD_PARAMS.value not in current
     ):
         return None
 
     if has_fw:
         current[Dimension.FRAMEWORK.value] = fw
     current[Dimension.METHOD.value] = method
+    current.pop(Dimension.METHOD_PARAMS.value, None)
     token = set_telemetry_context(current)
 
     missing_detector = any(

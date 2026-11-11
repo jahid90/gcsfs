@@ -11,6 +11,16 @@ from typing import Dict, Optional, Union
 # Allowed characters in RFC 9110 product-version tokens: ASCII alphanumeric, '_', '.', '-'
 _TOKEN_SANITIZE_REGEX = re.compile(r"[^a-zA-Z0-9_.-]")
 
+TRACKED_METHOD_PARAMS = frozenset(
+    {
+        "cache_options",
+        "detail",
+        "prefix",
+        "recursive",
+        "withdirs",
+    }
+)
+
 
 class Dimension(StrEnum):
     """Standard telemetry dimension keys."""
@@ -18,12 +28,26 @@ class Dimension(StrEnum):
     FRAMEWORK = "fw"
     ENVIRONMENT = "env"
     METHOD = "m"
+    METHOD_PARAMS = "mp"
 
 
 ALL_DIMENSIONS: frozenset[Dimension] = frozenset(Dimension)
 USER_AGENT_DIMENSIONS: frozenset[Dimension] = frozenset(
     {Dimension.ENVIRONMENT, Dimension.FRAMEWORK}
 )
+
+
+def canonicalize_method_params(raw: Optional[str]) -> str:
+    """Canonicalize raw parameter flags into sorted `.`-joined allowlisted names."""
+    if not raw or not isinstance(raw, str):
+        return ""
+    parts = {
+        part.strip()
+        for chunk in raw.split(",")
+        for part in chunk.split(".")
+        if part.strip() in TRACKED_METHOD_PARAMS
+    }
+    return ".".join(sorted(parts)) if parts else ""
 
 
 def sanitize_token(token: Optional[str], max_len: int = 64) -> Optional[str]:
@@ -69,14 +93,25 @@ def set_telemetry_context(
     """Set telemetry tokens mapping (or update a single dimension) in context."""
     if isinstance(tokens, Dimension):
         current = get_telemetry_context()
-        current[tokens.value] = str(value) if value is not None else ""
+        str_val = str(value) if value is not None else ""
+        if tokens is Dimension.METHOD_PARAMS:
+            str_val = canonicalize_method_params(str_val)
+            if str_val:
+                current[tokens.value] = str_val
+            else:
+                current.pop(tokens.value, None)
+        else:
+            current[tokens.value] = str_val
         return _current_telemetry.set(current)
-    normalized = {
-        (k.value if isinstance(k, Dimension) else str(k)): (
-            str(v) if v is not None else ""
-        )
-        for k, v in tokens.items()
-    }
+    normalized: Dict[str, str] = {}
+    for k, v in tokens.items():
+        key = k.value if isinstance(k, Dimension) else str(k)
+        str_val = str(v) if v is not None else ""
+        if key == Dimension.METHOD_PARAMS.value:
+            str_val = canonicalize_method_params(str_val)
+            if not str_val:
+                continue
+        normalized[key] = str_val
     return _current_telemetry.set(normalized)
 
 
