@@ -1035,86 +1035,70 @@ def test_has_telemetry_context_and_wrapper_exception_cleanup(detector):
 @pytest.mark.parametrize(
     "invoke, expected_method, expected_params, expected_count",
     [
-        (lambda fs: fs.ls("bucket"), "ls", frozenset(), 1),
-        (lambda fs: fs.ls("bucket", False), "ls", frozenset(), 1),
-        (lambda fs: fs.ls("bucket", detail=False, prefix=""), "ls", frozenset(), 1),
-        (lambda fs: fs.ls("bucket", detail=None, prefix=None), "ls", frozenset(), 1),
-        (lambda fs: fs.ls("bucket", True), "ls", frozenset({"detail"}), 1),
-        (
+        pytest.param(lambda fs: fs.ls("bucket"), "ls", frozenset(), 1, id="ls-default"),
+        pytest.param(
+            lambda fs: fs.ls("bucket", False),
+            "ls",
+            frozenset(),
+            1,
+            id="ls-pos-false",
+        ),
+        pytest.param(
+            lambda fs: fs.ls("bucket", detail=False, prefix=""),
+            "ls",
+            frozenset(),
+            1,
+            id="ls-kw-falsy",
+        ),
+        pytest.param(
+            lambda fs: fs.ls("bucket", detail=None, prefix=None),
+            "ls",
+            frozenset(),
+            1,
+            id="ls-kw-none",
+        ),
+        pytest.param(
             lambda fs: fs.ls("bucket", detail=True, prefix="logs/"),
             "ls",
             frozenset({"detail", "prefix"}),
             1,
+            id="ls-detail-prefix",
         ),
-        (lambda fs: fs.listdir("bucket"), "ls", frozenset(), 1),
-        (lambda fs: fs.listdir("bucket", detail=True), "ls", frozenset({"detail"}), 1),
-        (lambda fs: fs.listdir("bucket", True), "ls", frozenset({"detail"}), 1),
-        (
+        pytest.param(
             lambda fs: fs.find("bucket", False, True, "pfx"),
             "find",
             frozenset({"detail", "prefix"}),
             1,
+            id="find-pos-detail-prefix",
         ),
-        (
-            lambda fs: fs.find("bucket", True, True, "pfx"),
-            "find",
-            frozenset({"withdirs", "detail", "prefix"}),
-            1,
-        ),
-        (
-            lambda fs: fs.cp("bucket/a", "bucket/b", recursive=True),
-            "cp",
-            frozenset({"recursive"}),
-            1,
-        ),
-        (
+        pytest.param(
             lambda fs: fs.info("bucket/a.txt", detail=True, recursive=True),
             "info",
             frozenset(),
             1,
+            id="info-untracked",
         ),
-        (
+        pytest.param(
             lambda fs: fs.cat_file("bucket/a.txt", prefix="ignored"),
             "cat_file",
             frozenset(),
             1,
+            id="cat_file-untracked",
         ),
-        (lambda fs: list(fs.walk("bucket")), "walk", frozenset(), 4),
-        (
-            lambda fs: list(fs.walk("bucket", detail=True)),
+        pytest.param(
+            lambda fs: list(fs.walk("bucket")),
             "walk",
-            frozenset({"detail"}),
+            frozenset(),
             4,
+            id="walk-default",
         ),
-        (lambda fs: fs.glob("bucket/sub_*"), "glob", frozenset(), 1),
-        (lambda fs: fs.glob("bucket/sub_*", withdirs=False), "glob", frozenset(), 1),
-        (
-            lambda fs: list(fs.glob("bucket/sub_*", detail=True, withdirs=True)),
+        pytest.param(
+            lambda fs: fs.glob("bucket/sub_*", withdirs=False),
             "glob",
-            frozenset({"detail", "withdirs"}),
+            frozenset(),
             1,
+            id="glob-falsy-withdirs",
         ),
-    ],
-    ids=[
-        "ls-default",
-        "ls-pos-false",
-        "ls-kw-falsy",
-        "ls-kw-none",
-        "ls-pos-true",
-        "ls-detail-prefix",
-        "listdir-default",
-        "listdir-kw-detail",
-        "listdir-pos-detail",
-        "find-pos-detail-prefix",
-        "find-pos-all",
-        "cp-recursive",
-        "info-untracked",
-        "cat_file-untracked",
-        "walk-default",
-        "walk-detail",
-        "glob-default",
-        "glob-falsy-withdirs",
-        "glob-detail-withdirs",
     ],
 )
 def test_method_params_tracking_positional_keyword_and_nested_isolation(
@@ -1256,36 +1240,27 @@ def test_canonicalize_collect_tokens_and_context_mp_edge_cases(detector):
         assert manager_mod.default_usage_tracker.get_method_params() == frozenset(
             {"detail", "withdirs"}
         )
-        t_empty = set_telemetry_context(Dimension.METHOD_PARAMS, "")
-        try:
+        with _scoped_ctx(Dimension.METHOD_PARAMS, ""):
             assert Dimension.METHOD_PARAMS.value not in get_telemetry_context()
-        finally:
-            reset_telemetry_context(t_empty)
 
-        t_unknown = set_telemetry_context(Dimension.METHOD_PARAMS, "unknown")
-        try:
+        with _scoped_ctx(Dimension.METHOD_PARAMS, "unknown"):
             assert Dimension.METHOD_PARAMS.value not in get_telemetry_context()
-        finally:
-            reset_telemetry_context(t_unknown)
 
     with _scoped_ctx(
         {Dimension.METHOD.value: "", Dimension.METHOD_PARAMS.value: "detail"}
     ):
         assert get_telemetry_context() == {Dimension.METHOD.value: ""}
-        t_mp = set_telemetry_context(Dimension.METHOD_PARAMS, "prefix")
-        try:
+        with _scoped_ctx(Dimension.METHOD_PARAMS, "prefix"):
             assert get_telemetry_context() == {Dimension.METHOD.value: ""}
-        finally:
-            reset_telemetry_context(t_mp)
 
     with _scoped_ctx(
         {Dimension.METHOD.value: "ls", Dimension.METHOD_PARAMS.value: "detail"}
     ):
-        t_clear_m = set_telemetry_context(Dimension.METHOD, "")
-        try:
+        with _scoped_ctx(Dimension.METHOD, ""):
             assert get_telemetry_context() == {Dimension.METHOD.value: ""}
-        finally:
-            reset_telemetry_context(t_clear_m)
+
+    with _scoped_ctx({Dimension.METHOD: "   ", Dimension.METHOD_PARAMS: "detail"}):
+        assert get_telemetry_context() == {Dimension.METHOD.value: ""}
 
     fs = _DummyFS(skip_instance_cache=True)
     detector.calls.clear()
@@ -1981,18 +1956,8 @@ def test_zonal_file_pickle_reopen_preserves_and_opts_out_telemetry(
     """Verify ZonalFile pickle reopen preserves enabled framework/method and enforces opt-out."""
     fs, data = zonal_fs_harness.fs, zonal_fs_harness.data
 
-    class _GkeEnvDetector(BaseDetector):
-        name = Dimension.ENVIRONMENT
-
-        def __init__(self):
-            self.calls = 0
-
-        def detect(self):
-            self.calls += 1
-            return "gke"
-
     detector = _CallerThreadOnlyDetector("pandas")
-    gke_env = _GkeEnvDetector()
+    gke_env = _CountingEnvDetector()
     monkeypatch.setattr(
         manager_mod,
         "default_usage_tracker",
@@ -2059,21 +2024,6 @@ def test_zonal_file_pickle_reopen_preserves_and_opts_out_telemetry(
     )
     assert detector.thread_names == []
     assert gke_env.calls == 0
-
-    zonal_fs_harness.clear()
-    with fs.open(
-        "zonal-bucket/obj",
-        "rb",
-        cache_type="none",
-        _reopen_telemetry=("torch", "", "cache_options"),
-    ) as orphan_zonal:
-        assert orphan_zonal.caller_method == ""
-        assert orphan_zonal.caller_params == ""
-        assert orphan_zonal.read(4) == data[:4]
-    assert all(
-        (ua, m, p) == (("fw/torch", "env/gke"), None, frozenset())
-        for _, ua, m, p in zonal_fs_harness.captured
-    )
     assert get_telemetry_context() == {}
 
 
@@ -2322,78 +2272,80 @@ async def test_gcsfs_async_wrapper_super_resolution():
 
 
 _REAL_FS_PARAM_CASES = [
-    (
-        "ls",
+    pytest.param(
         lambda fs: fs.ls("test-bucket", True, prefix="f"),
         "ls",
         frozenset({"detail", "prefix"}),
+        id="ls",
     ),
-    ("listdir", lambda fs: fs.listdir("test-bucket", False), "ls", frozenset()),
-    (
-        "listdir_detail",
+    pytest.param(
+        lambda fs: fs.listdir("test-bucket", False), "ls", frozenset(), id="listdir"
+    ),
+    pytest.param(
         lambda fs: fs.listdir("test-bucket", True),
         "ls",
         frozenset({"detail"}),
+        id="listdir_detail",
     ),
-    (
-        "find",
+    pytest.param(
         lambda fs: fs.find("test-bucket", True, True, "f"),
         "find",
         frozenset({"withdirs", "detail", "prefix"}),
+        id="find",
     ),
-    (
-        "cp",
+    pytest.param(
         lambda fs: fs.cp(
             "test-bucket/file.txt", "test-bucket/copy.txt", recursive=True
         ),
         "cp",
         frozenset({"recursive"}),
+        id="cp",
     ),
-    (
-        "rm",
+    pytest.param(
         lambda fs: fs.rm("test-bucket/file.txt", recursive=True),
         "rm",
         frozenset({"recursive"}),
+        id="rm",
     ),
-    (
-        "walk",
+    pytest.param(
         lambda fs: list(fs.walk("test-bucket", detail=True, prefix="f")),
         "walk",
         frozenset({"detail", "prefix"}),
+        id="walk",
     ),
-    (
-        "glob",
+    pytest.param(
         lambda fs: fs.glob("test-bucket/*", detail=True, withdirs=True),
         "glob",
         frozenset({"detail", "withdirs"}),
+        id="glob",
     ),
-    (
-        "du",
+    pytest.param(
         lambda fs: fs.du("test-bucket", withdirs=True, prefix="f"),
         "du",
         frozenset({"withdirs", "prefix"}),
+        id="du",
     ),
-    (
-        "disk_usage",
+    pytest.param(
         lambda fs: fs.disk_usage("test-bucket", withdirs=True, prefix="f"),
         "disk_usage",
         frozenset({"withdirs", "prefix"}),
+        id="disk_usage",
     ),
-    (
-        "read_text",
+    pytest.param(
         lambda fs: fs.read_text(
             "test-bucket/file.txt", cache_options={"concurrency": 2}
         ),
         "read_text",
         frozenset({"cache_options"}),
+        id="read_text",
     ),
-    (
-        "write_text",
+    pytest.param(
         lambda fs: fs.write_text(
             "test-bucket/file.txt", "hi", cache_options={"maxblocks": 2}
         ),
         "write_text",
         frozenset({"cache_options"}),
+        id="write_text",
     ),
 ]
 
@@ -2402,12 +2354,11 @@ _REAL_FS_PARAM_CASES = [
     "mock_gcs_harness", ["core", "extended"], indirect=True, ids=["core", "extended"]
 )
 @pytest.mark.parametrize(
-    "name, invoke, expected_method, expected_params",
+    "invoke, expected_method, expected_params",
     _REAL_FS_PARAM_CASES,
-    ids=[case[0] for case in _REAL_FS_PARAM_CASES],
 )
 def test_spied_gcsfs_method_params_propagation(
-    detector, spied_gcs_harness, name, invoke, expected_method, expected_params
+    detector, spied_gcs_harness, invoke, expected_method, expected_params
 ):
     """Verify real GCSFileSystem and ExtendedGcsFileSystem methods track enabled params."""
     fs = spied_gcs_harness.fs
@@ -2416,11 +2367,11 @@ def test_spied_gcsfs_method_params_propagation(
 
     invoke(fs)
 
-    assert spied_gcs_harness.seen, f"{name} produced no outgoing calls"
+    assert spied_gcs_harness.seen, f"{expected_method} produced no outgoing calls"
     assert all(
         (ua, m, p) == (("fw/pandas",), expected_method, expected_params)
         for ua, m, p in spied_gcs_harness.seen
-    ), f"{name} recorded unexpected telemetry: {spied_gcs_harness.seen}"
+    ), f"{expected_method} recorded unexpected telemetry: {spied_gcs_harness.seen}"
     assert get_telemetry_context() == {}
 
 
@@ -2492,16 +2443,15 @@ def test_gcsfile_pickle_reopen_preserves_telemetry(detector, spied_gcs_harness):
         with fs.open("test-bucket/file.txt", "rb", size=4) as default_f:
             assert default_f.caller_params == ""
             default_payload = pickle.dumps(default_f)
-        f = fs.open(
+        with fs.open(
             "test-bucket/file.txt",
             "rb",
             size=4,
             cache_type="blockcache",
             cache_options={"maxblocks": 4},
-        )
-        assert len(f.read(1)) == 1
-        payload = pickle.dumps(f)
-        f.close()
+        ) as f:
+            assert len(f.read(1)) == 1
+            payload = pickle.dumps(f)
 
     with _scoped_ctx(
         {

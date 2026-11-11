@@ -735,8 +735,8 @@ def _clear_disabled_file_telemetry(file_obj) -> None:
 def _prepare_file_init_telemetry(
     file_obj,
     kwargs: dict[str, Any],
-    init_pos_spec: tuple[tuple[int, str], ...] = (),
-    args: tuple = (),
+    init_pos_spec: tuple[tuple[int, str], ...],
+    args: tuple,
 ) -> tuple[bool, Any, dict[str, str] | None]:
     """Initialize file handle telemetry attributes and capture any active outer context."""
     reopen_tel = kwargs.pop("_reopen_telemetry", _UNSET)
