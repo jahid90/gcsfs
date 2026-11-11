@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-from typing import Dict, List, Optional
 
 from gcsfs.telemetry.context import (
     ALL_DIMENSIONS,
@@ -17,8 +16,8 @@ from gcsfs.telemetry.detector import BaseDetector, FrameworkDetector
 class UsageMetricsTracker:
     """Coordinates multi-dimensional detectors and context propagation."""
 
-    def __init__(self, detectors: Optional[List[BaseDetector]] = None):
-        self.detectors: List[BaseDetector] = (
+    def __init__(self, detectors: list[BaseDetector] | None = None):
+        self.detectors: list[BaseDetector] = (
             list(detectors) if detectors is not None else []
         )
 
@@ -33,8 +32,8 @@ class UsageMetricsTracker:
         self,
         dimensions: frozenset[Dimension] = ALL_DIMENSIONS,
         *,
-        method: Optional[str] = None,
-    ) -> Dict[str, str]:
+        method: str | None = None,
+    ) -> dict[str, str]:
         """
         Collect active telemetry tokens across registered detectors.
 
@@ -42,13 +41,14 @@ class UsageMetricsTracker:
         ----------
         dimensions : frozenset[Dimension], optional
             Dimensions to collect and return. Defaults to ALL_DIMENSIONS.
-        method : str, optional
+        method : str | None, optional
             Top-level public method name to attach under Dimension.METHOD
             (or "" as a negative-cache sentinel for untracked entry points).
 
         Returns
         -------
-        Dict[str, str]: Mapping of dimension key to bare token value
+        dict[str, str]
+            Mapping of dimension key to bare token value
             (or empty string "" as a negative-cache sentinel when undetected).
         """
         if not self.is_enabled():
@@ -88,13 +88,19 @@ class UsageMetricsTracker:
     def get_tokens(
         self,
         dimensions: frozenset[Dimension] = ALL_DIMENSIONS,
-    ) -> List[str]:
+    ) -> list[str]:
         """
         Return formatted `<dim>/<val>` telemetry tokens for `dimensions`.
 
+        Parameters
+        ----------
+        dimensions : frozenset[Dimension], optional
+            Dimensions to format and return. Defaults to ALL_DIMENSIONS.
+
         Returns
         -------
-        List[str]: List of sanitized formatted token strings, e.g. ['fw/pandas', 'env/gke'].
+        list[str]
+            List of sanitized formatted token strings, e.g. ['fw/pandas', 'env/gke'].
         """
         token_map = self.collect_tokens_map(dimensions=dimensions)
         out = []
@@ -104,7 +110,7 @@ class UsageMetricsTracker:
                 out.append(f"{dim_key}/{clean_val}")
         return out
 
-    def get_dimension(self, dimension: Dimension) -> Optional[str]:
+    def get_dimension(self, dimension: Dimension) -> str | None:
         """
         Resolve a specific dimension's sanitized bare token value (e.g. Dimension.FRAMEWORK -> 'pandas').
         """
