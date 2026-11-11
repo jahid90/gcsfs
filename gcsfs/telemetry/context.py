@@ -64,25 +64,24 @@ def get_telemetry_context() -> dict[str, str]:
 
 
 def set_telemetry_context(
-    tokens: (
-        Mapping[str, str | None]
-        | Mapping[Dimension, str | None]
-        | Mapping[Dimension | str, str | None]
-        | Dimension
-    ),
+    tokens: Mapping[str, str | None] | Mapping[Dimension, str | None] | Dimension,
     value: str | None = None,
 ) -> contextvars.Token:
     """Set telemetry tokens mapping (or update a single dimension) in context."""
     if isinstance(tokens, Dimension):
         current = get_telemetry_context()
-        current[tokens.value] = str(value) if value is not None else ""
+        str_val = str(value) if value is not None else ""
+        if tokens is Dimension.METHOD and not sanitize_token(str_val):
+            str_val = ""
+        current[tokens.value] = str_val
         return _current_telemetry.set(current)
-    normalized = {
-        (k.value if isinstance(k, Dimension) else str(k)): (
-            str(v) if v is not None else ""
-        )
-        for k, v in tokens.items()
-    }
+    normalized: dict[str, str] = {}
+    for k, v in tokens.items():
+        key = k.value if isinstance(k, Dimension) else str(k)
+        str_val = str(v) if v is not None else ""
+        if key == Dimension.METHOD.value and not sanitize_token(str_val):
+            str_val = ""
+        normalized[key] = str_val
     return _current_telemetry.set(normalized)
 
 

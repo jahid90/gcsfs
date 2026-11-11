@@ -27,6 +27,7 @@ from gcsfs.telemetry.context import (
 from gcsfs.telemetry.detector import BaseDetector, FrameworkDetector
 from gcsfs.telemetry.manager import UsageMetricsTracker
 from gcsfs.telemetry.wrapper import (
+    _file_telemetry_context,
     _gcs_async_wrapper,
     _gcs_sync_wrapper,
     mirror_gcs_methods,
@@ -455,6 +456,29 @@ def detector(monkeypatch):
     return counting
 
 
+class _CountingEnvDetector(BaseDetector):
+    """Environment detector that counts invocations and returns `value`."""
+
+    name = Dimension.ENVIRONMENT
+
+    def __init__(self, value="gke"):
+        self.value = value
+        self.calls = 0
+
+    def detect(self):
+        self.calls += 1
+        return self.value
+
+
+@contextlib.contextmanager
+def _scoped_ctx(tokens, value=None):
+    token = set_telemetry_context(tokens, value)
+    try:
+        yield
+    finally:
+        reset_telemetry_context(token)
+
+
 class _DummyFile(fsspec.spec.AbstractBufferedFile):
     def _fetch_range(self, start, end):
         return self.fs.cat_file(self.path, start=start, end=end)
@@ -673,13 +697,13 @@ def test_file_inherited_methods_propagate_caller_framework_across_threads(detect
 
     for file_cls in (LeafFile, ZonalLikeFile):
         fs = _DummyFS(skip_instance_cache=True)
-        f = file_cls(fs, "bucket/f.txt", mode="rb", size=3, cache_type="none")
-        # Differs from the detector's "pandas", so a re-detection would show up
-        f.caller_framework = "torch"
-        out = []
-        t = threading.Thread(target=lambda: out.append(f.read()))
-        t.start()
-        t.join()
+        with file_cls(fs, "bucket/f.txt", mode="rb", size=3, cache_type="none") as f:
+            # Differs from the detector's "pandas", so a re-detection would show up
+            f.caller_framework = "torch"
+            out = []
+            t = threading.Thread(target=lambda: out.append(f.read()))
+            t.start()
+            t.join()
         assert out == [b"abc"], file_cls.__name__
         assert [tokens for _, tokens in fs.seen] == [("fw/torch",)], file_cls.__name__
         assert fs.seen_telemetry == ["open"], file_cls.__name__
@@ -796,30 +820,28 @@ def test_sync_wrapper_propagates_context_to_background_loop_thread(detector):
 @pytest.mark.parametrize(
     "invoke, expected_method, expected_count",
     [
-        (
+        pytest.param(
             lambda fs: fs.cat(["bucket/f1.txt", "bucket/f2.txt", "bucket/f3.txt"]),
             "cat",
             3,
+            id="cat",
         ),
-        (lambda fs: fs.move("bucket/a.txt", "bucket/b.txt"), "move", 4),
-        (lambda fs: fs.mv("bucket/a.txt", "bucket/b.txt"), "mv", 4),
-        (lambda fs: fs.created("bucket/a.txt"), "created", 1),
-        (lambda fs: fs.modified("bucket/a.txt"), "modified", 1),
-        (lambda fs: fs.sign("bucket/a.txt"), "sign", 1),
-        (lambda fs: fs.head("bucket/a.txt", size=2), "head", 2),
-        (lambda fs: fs.read_text("bucket/a.txt"), "read_text", 2),
-        (lambda fs: fs.listdir("bucket"), "ls", 1),
-    ],
-    ids=[
-        "cat",
-        "move",
-        "mv",
-        "created",
-        "modified",
-        "sign",
-        "head",
-        "read_text",
-        "listdir",
+        pytest.param(
+            lambda fs: fs.move("bucket/a.txt", "bucket/b.txt"), "move", 4, id="move"
+        ),
+        pytest.param(
+            lambda fs: fs.mv("bucket/a.txt", "bucket/b.txt"), "mv", 4, id="mv"
+        ),
+        pytest.param(lambda fs: fs.created("bucket/a.txt"), "created", 1, id="created"),
+        pytest.param(
+            lambda fs: fs.modified("bucket/a.txt"), "modified", 1, id="modified"
+        ),
+        pytest.param(lambda fs: fs.sign("bucket/a.txt"), "sign", 1, id="sign"),
+        pytest.param(lambda fs: fs.head("bucket/a.txt", size=2), "head", 2, id="head"),
+        pytest.param(
+            lambda fs: fs.read_text("bucket/a.txt"), "read_text", 2, id="read_text"
+        ),
+        pytest.param(lambda fs: fs.listdir("bucket"), "ls", 1, id="listdir"),
     ],
 )
 def test_method_detection_top_level_wins_and_public_entrypoints(
@@ -969,15 +991,6 @@ def test_has_telemetry_context_and_wrapper_exception_cleanup(detector):
     assert get_telemetry_context() == {}
 
 
-@contextlib.contextmanager
-def _scoped_ctx(tokens, value=None):
-    token = set_telemetry_context(tokens, value)
-    try:
-        yield
-    finally:
-        reset_telemetry_context(token)
-
-
 def test_user_agent_excludes_method_and_respects_opt_out(monkeypatch):
     """Verify User-Agent filters to fw/ and env/, get_tokens() defaults to all, and opt-out holds."""
     from gcsfs.core import _build_user_agent
@@ -1040,25 +1053,14 @@ def test_custom_detector_and_dimension_filtering(detector, monkeypatch):
         }
 
     # Dimension-filtered queries skip unrelated detectors.
-    env_calls = 0
-
-    class _CountingEnvDetector(BaseDetector):
-        @property
-        def name(self):
-            return Dimension.ENVIRONMENT
-
-        def detect(self):
-            nonlocal env_calls
-            env_calls += 1
-            return None
-
-    multi_tracker = UsageMetricsTracker(detectors=[detector, _CountingEnvDetector()])
+    env_det = _CountingEnvDetector(None)
+    multi_tracker = UsageMetricsTracker(detectors=[detector, env_det])
     with monkeypatch.context() as mp:
         mp.setattr(manager_mod, "default_usage_tracker", multi_tracker)
         detector.calls.clear()
         assert multi_tracker.get_dimension(Dimension.FRAMEWORK) == "pandas"
         assert len(detector.calls) == 1
-        assert env_calls == 0
+        assert env_det.calls == 0
 
         class _ChunkFile:
             def __init__(self):
@@ -1074,25 +1076,14 @@ def test_custom_detector_and_dimension_filtering(detector, monkeypatch):
         detector.calls.clear()
         assert _ChunkFile().read_chunks() == [["fw/pandas"]] * 5
         assert detector.calls == []
-        assert env_calls == 1
+        assert env_det.calls == 1
 
 
 def test_opted_out_fs_and_file_reopen_suppress_telemetry(
     detector, spied_gcs_harness, monkeypatch
 ):
     """Verify opted-out FS calls, open handles, and pickled reopens suppress active contexts."""
-
-    class _GkeEnvDetector(BaseDetector):
-        name = Dimension.ENVIRONMENT
-
-        def __init__(self):
-            self.calls = 0
-
-        def detect(self):
-            self.calls += 1
-            return "gke"
-
-    gke_env = _GkeEnvDetector()
+    gke_env = _CountingEnvDetector()
     fs = _DummyFS(skip_instance_cache=True)
     core_fs = spied_gcs_harness.fs
     detector.calls.clear()
@@ -1127,10 +1118,24 @@ def test_opted_out_fs_and_file_reopen_suppress_telemetry(
         )
         spied_gcs_harness.clear()
         detector.calls.clear()
+        assert get_telemetry_context() == {}
+        assert len(opted_out_file.read(2)) == 2
+        assert spied_gcs_harness.seen == [((), None)]
+        assert detector.calls == []
+        assert gke_env.calls == 0
+
+        spied_gcs_harness.clear()
+        detector.calls.clear()
         with _scoped_ctx(
-            {Dimension.FRAMEWORK.value: "ray", Dimension.METHOD.value: "find"}
+            {
+                Dimension.FRAMEWORK.value: "ray",
+                Dimension.METHOD.value: "find",
+                "region": "us",
+            }
         ):
             assert len(opted_out_file.read(2)) == 2
+            with _file_telemetry_context(opted_out_file):
+                assert manager_mod.default_usage_tracker.get_tokens() == []
         assert spied_gcs_harness.seen == [((), None)]
 
     spied_gcs_harness.clear()
@@ -1157,18 +1162,7 @@ async def test_opted_out_generators_and_nested_calls_suppress_telemetry(
     detector, monkeypatch, outer_ctx
 ):
     """Verify opted-out sync/async generators and nested calls negative-cache all detectors."""
-
-    class _GkeEnvDetector(BaseDetector):
-        name = Dimension.ENVIRONMENT
-
-        def __init__(self):
-            self.calls = 0
-
-        def detect(self):
-            self.calls += 1
-            return "gke"
-
-    gke_env = _GkeEnvDetector()
+    gke_env = _CountingEnvDetector()
     monkeypatch.setattr(
         manager_mod,
         "default_usage_tracker",
@@ -1736,6 +1730,7 @@ async def test_async_fetch_range_propagates_caller_framework():
 
     f.caller_framework = "pandas"
     await f._async_fetch_range(0, 10)
+    f.closed = True
     assert captured_context.get(Dimension.FRAMEWORK.value) == "pandas"
     assert captured_context.get(Dimension.METHOD.value) == "open"
 
@@ -1862,24 +1857,27 @@ def test_spied_gcsfs_listdir_alias_records_ls(detector, spied_gcs_harness):
 @pytest.mark.parametrize(
     "invoke, check",
     [
-        (
+        pytest.param(
             lambda fs: fs.getxattr("test-bucket/file.txt", "k"),
             lambda res: res == "v",
+            id="getxattr",
         ),
-        (
+        pytest.param(
             lambda fs: fs.checksum("test-bucket/file.txt"),
             lambda res: isinstance(res, int),
+            id="checksum",
         ),
-        (
+        pytest.param(
             lambda fs: fs.ukey("test-bucket/file.txt"),
             lambda res: len(res) == 64,
+            id="ukey",
         ),
-        (
+        pytest.param(
             lambda fs: fs.read_block("test-bucket/file.txt", 0, 2),
             lambda res: res == b"MO",
+            id="read_block",
         ),
     ],
-    ids=["getxattr", "checksum", "ukey", "read_block"],
 )
 def test_composite_helpers_negative_cache_method(
     detector, spied_gcs_harness, invoke, check
