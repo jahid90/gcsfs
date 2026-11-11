@@ -88,12 +88,7 @@ def get_telemetry_context() -> dict[str, str]:
 
 
 def set_telemetry_context(
-    tokens: (
-        Mapping[str, str | None]
-        | Mapping[Dimension, str | None]
-        | Mapping[Dimension | str, str | None]
-        | Dimension
-    ),
+    tokens: Mapping[str, str | None] | Mapping[Dimension, str | None] | Dimension,
     value: str | None = None,
 ) -> contextvars.Token:
     """Set telemetry tokens mapping (or update a single dimension) in context."""
@@ -107,6 +102,8 @@ def set_telemetry_context(
             else:
                 current.pop(tokens.value, None)
         else:
+            if tokens is Dimension.METHOD and not sanitize_token(str_val):
+                str_val = ""
             current[tokens.value] = str_val
             if tokens is Dimension.METHOD and not str_val:
                 current.pop(Dimension.METHOD_PARAMS.value, None)
@@ -119,6 +116,8 @@ def set_telemetry_context(
             str_val = canonicalize_method_params(str_val)
             if not str_val:
                 continue
+        elif key == Dimension.METHOD.value and not sanitize_token(str_val):
+            str_val = ""
         normalized[key] = str_val
     if normalized.get(Dimension.METHOD.value) == "":
         normalized.pop(Dimension.METHOD_PARAMS.value, None)
