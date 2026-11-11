@@ -161,6 +161,7 @@ def _positional_tracked_params(
 
 
 def _is_truthy_param(val: Any) -> bool:
+    """Return `bool(val)`, treating values whose `__bool__` raises as falsy."""
     try:
         return bool(val)
     except Exception:
@@ -260,7 +261,11 @@ def _resolve_reopen_tokens(reopen_tel: Any) -> dict[str, str]:
     if not manager.default_usage_tracker.is_enabled() or reopen_tel is None:
         return _disabled_tokens_map()
     fw, method = reopen_tel[0], reopen_tel[1]
-    params = canonicalize_method_params(reopen_tel[2]) if len(reopen_tel) > 2 else ""
+    params = (
+        canonicalize_method_params(reopen_tel[2])
+        if method and len(reopen_tel) > 2
+        else ""
+    )
     seed = {Dimension.FRAMEWORK.value: fw, Dimension.METHOD.value: method}
     if params:
         seed[Dimension.METHOD_PARAMS.value] = params
@@ -272,8 +277,9 @@ def with_telemetry_context(func: Callable) -> Callable:
     """
     Decorator for plain sync entry points that `mirror_gcs_methods` doesn't wrap (e.g. `_open`).
 
-    Detects the caller framework and records `Dimension.METHOD` once on the caller thread
-    when no method context is active, so nested requests carry them across thread boundaries.
+    Detects the caller framework and records `Dimension.METHOD` and `Dimension.METHOD_PARAMS`
+    once on the caller thread when no method context is active, so nested requests carry them
+    across thread boundaries.
     """
     method_name = _tracked_method_name(func)
     pos_spec = _positional_tracked_params(func, method_name)
@@ -671,6 +677,8 @@ def _setup_file_telemetry(file_obj) -> contextvars.Token | None:
     else:
         method = "open"
         params = ""
+    if not method:
+        params = ""
 
     # Fast path: telemetry already active (e.g. nested file method calls), skip a redundant set/reset
     if (
@@ -769,7 +777,9 @@ def _prepare_file_init_telemetry(
         file_obj.caller_framework = reopen_tel[0]
         file_obj.caller_method = reopen_tel[1]
         file_obj.caller_params = (
-            canonicalize_method_params(reopen_tel[2]) if len(reopen_tel) > 2 else ""
+            canonicalize_method_params(reopen_tel[2])
+            if file_obj.caller_method and len(reopen_tel) > 2
+            else ""
         )
     ctx = get_telemetry_context() if has_telemetry_context() else None
     has_ctx_method = ctx is not None and Dimension.METHOD.value in ctx
@@ -778,15 +788,16 @@ def _prepare_file_init_telemetry(
             ctx[Dimension.METHOD.value] if has_ctx_method else "open"
         )
     if not hasattr(file_obj, "caller_params"):
-        file_obj.caller_params = (
-            canonicalize_method_params(ctx.get(Dimension.METHOD_PARAMS.value, ""))
-            if has_ctx_method
-            else (
-                _extract_method_params(init_pos_spec, args, kwargs, "open")
-                if file_obj.caller_method
-                else ""
+        if not file_obj.caller_method:
+            file_obj.caller_params = ""
+        elif has_ctx_method:
+            file_obj.caller_params = canonicalize_method_params(
+                ctx.get(Dimension.METHOD_PARAMS.value, "")
             )
-        )
+        else:
+            file_obj.caller_params = _extract_method_params(
+                init_pos_spec, args, kwargs, "open"
+            )
     return True, reopen_tel, ctx
 
 

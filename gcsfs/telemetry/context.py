@@ -38,16 +38,16 @@ USER_AGENT_DIMENSIONS: frozenset[Dimension] = frozenset(
 
 
 def canonicalize_method_params(raw: str | None) -> str:
-    """Canonicalize raw parameter flags into sorted `.`-joined allowlisted names."""
+    """Canonicalize `raw` into sorted `.`-joined allowlisted names (or `""` if `None`/non-string)."""
     if not raw or not isinstance(raw, str):
         return ""
-    parts = {
-        part.strip()
-        for chunk in raw.split(",")
-        for part in chunk.split(".")
-        if part.strip() in TRACKED_METHOD_PARAMS
-    }
-    return ".".join(sorted(parts)) if parts else ""
+    parts: set[str] = set()
+    for chunk in raw.split(","):
+        for part in chunk.split("."):
+            cleaned = part.strip()
+            if cleaned in TRACKED_METHOD_PARAMS:
+                parts.add(cleaned)
+    return ".".join(sorted(parts))
 
 
 def sanitize_token(token: str | None, max_len: int = 64) -> str | None:
@@ -102,12 +102,14 @@ def set_telemetry_context(
         str_val = str(value) if value is not None else ""
         if tokens is Dimension.METHOD_PARAMS:
             str_val = canonicalize_method_params(str_val)
-            if str_val:
+            if str_val and current.get(Dimension.METHOD.value) != "":
                 current[tokens.value] = str_val
             else:
                 current.pop(tokens.value, None)
         else:
             current[tokens.value] = str_val
+            if tokens is Dimension.METHOD and not str_val:
+                current.pop(Dimension.METHOD_PARAMS.value, None)
         return _current_telemetry.set(current)
     normalized: dict[str, str] = {}
     for k, v in tokens.items():
@@ -118,6 +120,8 @@ def set_telemetry_context(
             if not str_val:
                 continue
         normalized[key] = str_val
+    if normalized.get(Dimension.METHOD.value) == "":
+        normalized.pop(Dimension.METHOD_PARAMS.value, None)
     return _current_telemetry.set(normalized)
 
 

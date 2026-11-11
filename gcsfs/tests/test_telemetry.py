@@ -31,7 +31,6 @@ from gcsfs.telemetry.manager import UsageMetricsTracker
 from gcsfs.telemetry.wrapper import (
     _gcs_async_wrapper,
     _gcs_sync_wrapper,
-    _positional_tracked_params,
     mirror_gcs_methods,
     with_telemetry_context,
     wrap_file_methods,
@@ -887,9 +886,14 @@ async def test_native_async_entrypoints_and_unwrapped_private_helper(detector):
     fs.clear()
     await fs.open_async("bucket/a.txt")
 
-    assert fs.seen_telemetry == ["open_async"]
+    assert fs._recorded() == [(("fw/pandas",), "open_async", frozenset())]
 
-    fs.clear()
+    await fs.open_async("bucket/a.txt", cache_options={"maxblocks": 4})
+
+    assert fs._recorded() == [
+        (("fw/pandas",), "open_async", frozenset({"cache_options"}))
+    ]
+
     await fs._list_objects("bucket")
 
     assert fs.seen_telemetry == [None]
@@ -1006,9 +1010,165 @@ def test_has_telemetry_context_and_wrapper_exception_cleanup(detector):
     assert get_telemetry_context() == {}
 
 
+@pytest.mark.parametrize(
+    "invoke, expected_method, expected_params, expected_count",
+    [
+        (lambda fs: fs.ls("bucket"), "ls", frozenset(), 1),
+        (lambda fs: fs.ls("bucket", False), "ls", frozenset(), 1),
+        (lambda fs: fs.ls("bucket", detail=False, prefix=""), "ls", frozenset(), 1),
+        (lambda fs: fs.ls("bucket", detail=None, prefix=None), "ls", frozenset(), 1),
+        (lambda fs: fs.ls("bucket", True), "ls", frozenset({"detail"}), 1),
+        (
+            lambda fs: fs.ls("bucket", detail=True, prefix="logs/"),
+            "ls",
+            frozenset({"detail", "prefix"}),
+            1,
+        ),
+        (lambda fs: fs.listdir("bucket"), "ls", frozenset(), 1),
+        (lambda fs: fs.listdir("bucket", detail=True), "ls", frozenset({"detail"}), 1),
+        (lambda fs: fs.listdir("bucket", True), "ls", frozenset({"detail"}), 1),
+        (
+            lambda fs: fs.find("bucket", False, True, "pfx"),
+            "find",
+            frozenset({"detail", "prefix"}),
+            1,
+        ),
+        (
+            lambda fs: fs.find("bucket", True, True, "pfx"),
+            "find",
+            frozenset({"withdirs", "detail", "prefix"}),
+            1,
+        ),
+        (
+            lambda fs: fs.cp("bucket/a", "bucket/b", recursive=True),
+            "cp",
+            frozenset({"recursive"}),
+            1,
+        ),
+        (
+            lambda fs: fs.info("bucket/a.txt", detail=True, recursive=True),
+            "info",
+            frozenset(),
+            1,
+        ),
+        (
+            lambda fs: fs.cat_file("bucket/a.txt", prefix="ignored"),
+            "cat_file",
+            frozenset(),
+            1,
+        ),
+        (lambda fs: list(fs.walk("bucket")), "walk", frozenset(), 4),
+        (
+            lambda fs: list(fs.walk("bucket", detail=True)),
+            "walk",
+            frozenset({"detail"}),
+            4,
+        ),
+        (lambda fs: fs.glob("bucket/sub_*"), "glob", frozenset(), 1),
+        (lambda fs: fs.glob("bucket/sub_*", withdirs=False), "glob", frozenset(), 1),
+        (
+            lambda fs: list(fs.glob("bucket/sub_*", detail=True, withdirs=True)),
+            "glob",
+            frozenset({"detail", "withdirs"}),
+            1,
+        ),
+    ],
+    ids=[
+        "ls-default",
+        "ls-pos-false",
+        "ls-kw-falsy",
+        "ls-kw-none",
+        "ls-pos-true",
+        "ls-detail-prefix",
+        "listdir-default",
+        "listdir-kw-detail",
+        "listdir-pos-detail",
+        "find-pos-detail-prefix",
+        "find-pos-all",
+        "cp-recursive",
+        "info-untracked",
+        "cat_file-untracked",
+        "walk-default",
+        "walk-detail",
+        "glob-default",
+        "glob-falsy-withdirs",
+        "glob-detail-withdirs",
+    ],
+)
+def test_method_params_tracking_positional_keyword_and_nested_isolation(
+    detector, invoke, expected_method, expected_params, expected_count
+):
+    """Verify positional, keyword, falsy, untracked, and nested parameter tracking."""
+    fs = _DummyFS(skip_instance_cache=True)
+
+    invoke(fs)
+
+    assert (
+        fs._recorded()
+        == [(("fw/pandas",), expected_method, expected_params)] * expected_count
+    )
+
+
 @pytest.mark.asyncio
-async def test_method_params_tracking_positional_keyword_and_nested_isolation(detector):
-    """Verify enabled per-method parameter tracking, safety guards, and nested isolation."""
+async def test_method_params_async_rm_and_untracked_tree(detector):
+    """Verify async `_rm` positional tracking and `tree` ignoring untracked flags."""
+    fs = _DummyFS(skip_instance_cache=True)
+
+    await fs._rm("bucket/dir", True)
+    assert fs._recorded() == [(("fw/pandas",), "rm", frozenset({"recursive"}))]
+
+    fs.tree("bucket", prefix="  ")
+    rec = fs._recorded()
+    assert len(rec) >= 1
+    assert all((m, p) == ("tree", frozenset()) for _, m, p in rec)
+
+
+def test_method_params_subclass_bound_wrappers_and_unhashable_callable(
+    detector, monkeypatch
+):
+    """Verify subclass parameter order, wrapped bound overrides, and unhashable callables."""
+
+    class _SubOrderFS(_DummyFS):
+        async def _find(self, path, maxdepth=None, withdirs=False, **kwargs):
+            self._record()
+            return ["bucket/sub_file.txt"]
+
+    sub_fs = _SubOrderFS(skip_instance_cache=True)
+    sub_fs.find("bucket", 2)
+    assert sub_fs._recorded() == [(("fw/pandas",), "find", frozenset())]
+
+    sub_fs.find("bucket", 2, True)
+    assert sub_fs._recorded() == [(("fw/pandas",), "find", frozenset({"withdirs"}))]
+
+    fs = _DummyFS(skip_instance_cache=True)
+    orig_bound_ls = fs._ls
+
+    @functools.wraps(orig_bound_ls)
+    async def wrapped_ls(*args, **kwargs):
+        return await orig_bound_ls(*args, **kwargs)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(fs, "_ls", wrapped_ls)
+        fs.ls("bucket", True)
+        assert fs._recorded() == [(("fw/pandas",), "ls", frozenset({"detail"}))]
+        fs.ls("bucket", False, "my_prefix")
+        assert fs._recorded() == [(("fw/pandas",), "ls", frozenset({"prefix"}))]
+
+    class _UnhashableLs:
+        __hash__ = None
+
+        async def __call__(self, path, detail=False, prefix="", **kwargs):
+            fs._record()
+            return [path]
+
+    with monkeypatch.context() as mp:
+        mp.setattr(fs, "_ls", _UnhashableLs())
+        fs.ls("bucket", True)
+        assert fs._recorded() == [(("fw/pandas",), "ls", frozenset({"detail"}))]
+
+
+def test_method_params_ambiguous_bool_and_opt_out_skip(detector, monkeypatch):
+    """Verify raising `__bool__` is ignored safely and skipped entirely when opted out."""
 
     class _AmbiguousBool:
         def __init__(self):
@@ -1019,113 +1179,24 @@ async def test_method_params_tracking_positional_keyword_and_nested_isolation(de
             raise ValueError("The truth value of an array is ambiguous")
 
     fs = _DummyFS(skip_instance_cache=True)
-
-    # 1. Default and explicit falsy values (False, "", None) -> empty; truthy -> recorded.
-    for args, kwargs, expected in [
-        (("bucket",), {}, frozenset()),
-        (("bucket", False), {}, frozenset()),
-        (("bucket",), {"detail": False, "prefix": ""}, frozenset()),
-        (("bucket",), {"detail": None, "prefix": None}, frozenset()),
-        (("bucket", True), {}, frozenset({"detail"})),
-        (
-            ("bucket",),
-            {"detail": True, "prefix": "logs/"},
-            frozenset({"detail", "prefix"}),
-        ),
-    ]:
-        fs.ls(*args, **kwargs)
-        assert fs._recorded() == [(("fw/pandas",), "ls", expected)]
-
-    # 2. `listdir` alias captures only caller-passed `detail` (not fsspec default detail=True).
-    for invoke, expected in (
-        (lambda: fs.listdir("bucket"), frozenset()),
-        (lambda: fs.listdir("bucket", detail=True), frozenset({"detail"})),
-        (lambda: fs.listdir("bucket", True), frozenset({"detail"})),
-    ):
-        invoke()
-        assert fs._recorded() == [(("fw/pandas",), "ls", expected)]
-
-    # 3. Positional/keyword extraction (`find`, `cp`, `rm`) and untracked-param methods.
-    for invoke, method, expected in (
-        (
-            lambda: fs.find("bucket", False, True, "pfx"),
-            "find",
-            frozenset({"detail", "prefix"}),
-        ),
-        (
-            lambda: fs.find("bucket", True, True, "pfx"),
-            "find",
-            frozenset({"withdirs", "detail", "prefix"}),
-        ),
-        (
-            lambda: fs.cp("bucket/a", "bucket/b", recursive=True),
-            "cp",
-            frozenset({"recursive"}),
-        ),
-        (
-            lambda: fs.info("bucket/a.txt", detail=True, recursive=True),
-            "info",
-            frozenset(),
-        ),
-        (
-            lambda: fs.cat_file("bucket/a.txt", prefix="ignored"),
-            "cat_file",
-            frozenset(),
-        ),
-    ):
-        invoke()
-        assert fs._recorded() == [(("fw/pandas",), method, expected)]
-
-    await fs._rm("bucket/dir", True)
-    assert fs._recorded() == [(("fw/pandas",), "rm", frozenset({"recursive"}))]
-
-    fs.tree("bucket", prefix="  ")
-    rec = fs._recorded()
-    assert rec and all((m, p) == ("tree", frozenset()) for _, m, p in rec)
-
-    # 4. Dynamic subclass overriding `_find` binds positional args against the subclass signature.
-    class _SubOrderFS(_DummyFS):
-        async def _find(self, path, maxdepth=None, withdirs=False, **kwargs):
-            self._record()
-            return ["bucket/sub_file.txt"]
-
-    sub_fs = _SubOrderFS(skip_instance_cache=True)
-    sub_fs.find("bucket", 2)
-    assert sub_fs._recorded() == [(("fw/pandas",), "find", frozenset())]
-    sub_fs.find("bucket", 2, True)
-    assert sub_fs._recorded() == [(("fw/pandas",), "find", frozenset({"withdirs"}))]
-
-    # 5. Raising `__bool__` is caught when enabled, and never evaluated when opted out.
     amb, amb_opt_out = _AmbiguousBool(), _AmbiguousBool()
+
     fs.ls("bucket", prefix=amb)
-    assert amb.calls == 1 and fs._recorded() == [(("fw/pandas",), "ls", frozenset())]
-    with pytest.MonkeyPatch.context() as mp:
+
+    assert amb.calls == 1
+    assert fs._recorded() == [(("fw/pandas",), "ls", frozenset())]
+
+    with monkeypatch.context() as mp:
         mp.setenv("DO_NOT_TRACK", "1")
         fs.ls("bucket", prefix=amb_opt_out)
-    assert amb_opt_out.calls == 0
-    fs._recorded()
 
-    # 6. Nested isolation (`walk`, `glob`) and positional `open` `cache_options`.
-    for count_len, invoke, method, expected in (
-        (True, lambda: list(fs.walk("bucket")), "walk", frozenset()),
-        (
-            True,
-            lambda: list(fs.walk("bucket", detail=True)),
-            "walk",
-            frozenset({"detail"}),
-        ),
-        (False, lambda: fs.glob("bucket/sub_*"), "glob", frozenset()),
-        (False, lambda: fs.glob("bucket/sub_*", withdirs=False), "glob", frozenset()),
-        (
-            False,
-            lambda: list(fs.glob("bucket/sub_*", detail=True, withdirs=True)),
-            "glob",
-            frozenset({"detail", "withdirs"}),
-        ),
-    ):
-        res = invoke()
-        assert (len(res) == 4) if count_len else (res == ["bucket/sub_file.txt"])
-        assert set(fs._recorded()) == {(("fw/pandas",), method, expected)}
+    assert amb_opt_out.calls == 0
+    assert fs._recorded() == [((), None, frozenset())]
+
+
+def test_open_positional_cache_options_and_ambient_mp_isolation(detector):
+    """Verify positional `cache_options` capture on `open` and handle isolation from ambient `mp`."""
+    fs = _DummyFS(skip_instance_cache=True)
 
     with fs.open(
         "bucket/a.txt", "rb", None, {"maxblocks": 4}, cache_type="blockcache"
@@ -1134,47 +1205,6 @@ async def test_method_params_tracking_positional_keyword_and_nested_isolation(de
     assert (
         fs._recorded() == [(("fw/pandas",), "open", frozenset({"cache_options"}))] * 2
     )
-
-    # 7. Partial preset framework reuses "jax" without stack walking and clears orphan preset mp.
-    detector.calls.clear()
-    with _scoped_ctx(
-        {Dimension.FRAMEWORK.value: "jax", Dimension.METHOD_PARAMS.value: "detail"}
-    ):
-        assert fs.find("bucket", withdirs=True) == ["bucket/sub_file.txt"]
-        assert fs._recorded() == [(("fw/jax",), "find", frozenset({"withdirs"}))]
-        assert detector.calls == []
-    assert get_telemetry_context() == {}
-
-    # 8. Wrapped bound-method overrides preserve self-stripping and direct unit helpers.
-    orig_bound_ls = fs._ls
-
-    @functools.wraps(orig_bound_ls)
-    async def wrapped_ls(*args, **kwargs):
-        return await orig_bound_ls(*args, **kwargs)
-
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(fs, "_ls", wrapped_ls)
-        fs.ls("bucket", True)
-        assert fs._recorded() == [(("fw/pandas",), "ls", frozenset({"detail"}))]
-        fs.ls("bucket", False, "my_prefix")
-        assert fs._recorded() == [(("fw/pandas",), "ls", frozenset({"prefix"}))]
-
-    class _UnhashableLs:
-        __hash__ = None
-
-        def __call__(self, path, detail=False):
-            return []
-
-    assert _positional_tracked_params(_UnhashableLs(), "ls") == ((1, "detail"),)
-    assert (
-        canonicalize_method_params("detail.withdirs, unknown, detail")
-        == "detail.withdirs"
-    )
-    assert canonicalize_method_params(None) == ""
-    with _scoped_ctx(Dimension.METHOD_PARAMS, "withdirs, detail"):
-        assert manager_mod.default_usage_tracker.get_method_params() == frozenset(
-            {"detail", "withdirs"}
-        )
 
     with fs.open("bucket/a.txt", "rb") as plain_f:
         fs._recorded()
@@ -1186,7 +1216,85 @@ async def test_method_params_tracking_positional_keyword_and_nested_isolation(de
             }
         ):
             assert plain_f.read(1) == b"a"
-            assert fs._recorded() == [(("fw/pandas",), "open", frozenset())]
+    assert fs._recorded() == [(("fw/pandas",), "open", frozenset())]
+
+
+def test_canonicalize_collect_tokens_and_context_mp_edge_cases(detector):
+    """Verify canonicalization, orphan `mp` cleanup, and direct `collect_tokens_map` branches."""
+    assert (
+        canonicalize_method_params("detail.withdirs, unknown, detail")
+        == "detail.withdirs"
+    )
+    assert canonicalize_method_params(None) == ""
+    assert canonicalize_method_params("") == ""
+    assert canonicalize_method_params("unknown.foo") == ""
+    assert canonicalize_method_params(123) == ""
+
+    with _scoped_ctx(Dimension.METHOD_PARAMS, "withdirs, detail"):
+        assert manager_mod.default_usage_tracker.get_method_params() == frozenset(
+            {"detail", "withdirs"}
+        )
+        t_empty = set_telemetry_context(Dimension.METHOD_PARAMS, "")
+        try:
+            assert Dimension.METHOD_PARAMS.value not in get_telemetry_context()
+        finally:
+            reset_telemetry_context(t_empty)
+
+        t_unknown = set_telemetry_context(Dimension.METHOD_PARAMS, "unknown")
+        try:
+            assert Dimension.METHOD_PARAMS.value not in get_telemetry_context()
+        finally:
+            reset_telemetry_context(t_unknown)
+
+    with _scoped_ctx(
+        {Dimension.METHOD.value: "", Dimension.METHOD_PARAMS.value: "detail"}
+    ):
+        assert get_telemetry_context() == {Dimension.METHOD.value: ""}
+        t_mp = set_telemetry_context(Dimension.METHOD_PARAMS, "prefix")
+        try:
+            assert get_telemetry_context() == {Dimension.METHOD.value: ""}
+        finally:
+            reset_telemetry_context(t_mp)
+
+    with _scoped_ctx(
+        {Dimension.METHOD.value: "ls", Dimension.METHOD_PARAMS.value: "detail"}
+    ):
+        t_clear_m = set_telemetry_context(Dimension.METHOD, "")
+        try:
+            assert get_telemetry_context() == {Dimension.METHOD.value: ""}
+        finally:
+            reset_telemetry_context(t_clear_m)
+
+    fs = _DummyFS(skip_instance_cache=True)
+    detector.calls.clear()
+    with _scoped_ctx(
+        {Dimension.FRAMEWORK.value: "jax", Dimension.METHOD_PARAMS.value: "detail"}
+    ):
+        assert fs.find("bucket", withdirs=True) == ["bucket/sub_file.txt"]
+        assert fs._recorded() == [(("fw/jax",), "find", frozenset({"withdirs"}))]
+        assert fs.find("bucket") == ["bucket/sub_file.txt"]
+        assert fs._recorded() == [(("fw/jax",), "find", frozenset())]
+        assert detector.calls == []
+    assert get_telemetry_context() == {}
+
+    tracker = UsageMetricsTracker()
+    assert tracker.collect_tokens_map(method="", method_params="detail") == {
+        Dimension.METHOD.value: ""
+    }
+    with _scoped_ctx(
+        {Dimension.FRAMEWORK.value: "jax", Dimension.METHOD_PARAMS.value: "detail"}
+    ):
+        assert tracker.collect_tokens_map(method="find", method_params="") == {
+            Dimension.FRAMEWORK.value: "jax",
+            Dimension.METHOD.value: "find",
+        }
+    with _scoped_ctx(
+        {Dimension.METHOD.value: "walk", Dimension.METHOD_PARAMS.value: "detail"}
+    ):
+        assert tracker.collect_tokens_map(method="ls", method_params="prefix") == {
+            Dimension.METHOD.value: "walk",
+            Dimension.METHOD_PARAMS.value: "detail",
+        }
 
 
 @contextlib.contextmanager
@@ -1516,6 +1624,22 @@ def test_extended_gcsfs_and_zonal_file_method_and_params_propagation(
         zf_cls.close()
 
     assert detector.calls == [caller_tid]
+    assert expected_ops.issubset({op for op, *_ in zonal_fs_harness.captured})
+    assert all(
+        (ua, m, p) == (("fw/pandas",), "open", frozenset({"cache_options"}))
+        for _, ua, m, p in zonal_fs_harness.captured
+    )
+    assert get_telemetry_context() == {}
+
+    fs.invalidate_storage_layout_cache()
+    zonal_fs_harness.clear()
+    with fs._open(
+        "zonal-bucket/obj",
+        "rb",
+        cache_type="blockcache",
+        cache_options={"maxblocks": 4},
+    ) as zf_internal:
+        assert zf_internal.read() == data
     assert expected_ops.issubset({op for op, *_ in zonal_fs_harness.captured})
     assert all(
         (ua, m, p) == (("fw/pandas",), "open", frozenset({"cache_options"}))
@@ -1885,23 +2009,38 @@ def test_zonal_file_pickle_reopen_preserves_and_opts_out_telemetry(
     )
 
     with _scoped_ctx(Dimension.FRAMEWORK, "torch"):
-        with fs.open("zonal-bucket/obj", "rb", cache_type="none") as f:
+        with fs.open(
+            "zonal-bucket/obj",
+            "rb",
+            cache_type="blockcache",
+            cache_options={"maxblocks": 4},
+        ) as f:
             enabled_payload = pickle.dumps(f)
 
     detector.thread_names.clear()
     gke_env.calls = 0
     zonal_fs_harness.clear()
-    with _scoped_ctx({Dimension.FRAMEWORK.value: "ray", Dimension.METHOD.value: "cat"}):
+    with _scoped_ctx(
+        {
+            Dimension.FRAMEWORK.value: "ray",
+            Dimension.METHOD.value: "cat",
+            Dimension.METHOD_PARAMS.value: "detail",
+        }
+    ):
         with pickle.loads(enabled_payload) as reopened:
             assert reopened.caller_framework == "torch"
             assert reopened.caller_method == "open"
+            assert reopened.caller_params == "cache_options"
             assert "_reopen_telemetry" not in reopened.kwargs
             assert reopened.read(4) == data[:4]
     assert detector.thread_names == []
     assert zonal_fs_harness.captured
     assert all(
-        ua == ("fw/torch", "env/gke") and m == "open" and p == frozenset()
-        for _, ua, m, p in zonal_fs_harness.captured
+        ua == ("fw/torch", "env/gke") for _, ua, _, _ in zonal_fs_harness.captured
+    )
+    assert all(m == "open" for _, _, m, _ in zonal_fs_harness.captured)
+    assert all(
+        p == frozenset({"cache_options"}) for _, _, _, p in zonal_fs_harness.captured
     )
 
     with monkeypatch.context() as mp:
@@ -1913,7 +2052,11 @@ def test_zonal_file_pickle_reopen_preserves_and_opts_out_telemetry(
     gke_env.calls = 0
     zonal_fs_harness.clear()
     with _scoped_ctx(
-        {Dimension.FRAMEWORK.value: "ray", Dimension.METHOD.value: "find"}
+        {
+            Dimension.FRAMEWORK.value: "ray",
+            Dimension.METHOD.value: "find",
+            Dimension.METHOD_PARAMS.value: "detail",
+        }
     ):
         with pickle.loads(opted_out_payload) as reopened_opted_out:
             assert reopened_opted_out._telemetry_disabled is True
@@ -1925,6 +2068,21 @@ def test_zonal_file_pickle_reopen_preserves_and_opts_out_telemetry(
     )
     assert detector.thread_names == []
     assert gke_env.calls == 0
+
+    zonal_fs_harness.clear()
+    with fs.open(
+        "zonal-bucket/obj",
+        "rb",
+        cache_type="none",
+        _reopen_telemetry=("torch", "", "cache_options"),
+    ) as orphan_zonal:
+        assert orphan_zonal.caller_method == ""
+        assert orphan_zonal.caller_params == ""
+        assert orphan_zonal.read(4) == data[:4]
+    assert all(
+        (ua, m, p) == (("fw/torch", "env/gke"), None, frozenset())
+        for _, ua, m, p in zonal_fs_harness.captured
+    )
     assert get_telemetry_context() == {}
 
 
@@ -2110,7 +2268,9 @@ def spied_gcs_harness(mock_gcs_harness, monkeypatch):
         res = await orig_call(self, method, path, *args, **kwargs)
         if isinstance(res, dict) and "size" in res:
             res.setdefault("metadata", {"k": "v"})
-        elif method == "GET" and "download" in str(path) and isinstance(res, tuple):
+        if "rewriteTo" in str(path) and isinstance(res, dict):
+            res.setdefault("done", True)
+        if method == "GET" and "download" in str(path) and isinstance(res, tuple):
             rng = (kwargs.get("headers") or {}).get("Range", "")
             if rng.startswith("bytes="):
                 s_str, e_str = rng.removeprefix("bytes=").split("-")
@@ -2169,13 +2329,107 @@ async def test_gcsfs_async_wrapper_super_resolution():
         mock_super.assert_awaited_once()
 
 
-def test_spied_gcsfs_listdir_alias_records_ls(detector, spied_gcs_harness):
-    """Verify `GCSFileSystem.listdir` alias attributes its call to `ls`."""
+_REAL_FS_PARAM_CASES = [
+    (
+        "ls",
+        lambda fs: fs.ls("test-bucket", True, prefix="f"),
+        "ls",
+        frozenset({"detail", "prefix"}),
+    ),
+    ("listdir", lambda fs: fs.listdir("test-bucket", False), "ls", frozenset()),
+    (
+        "listdir_detail",
+        lambda fs: fs.listdir("test-bucket", True),
+        "ls",
+        frozenset({"detail"}),
+    ),
+    (
+        "find",
+        lambda fs: fs.find("test-bucket", True, True, "f"),
+        "find",
+        frozenset({"withdirs", "detail", "prefix"}),
+    ),
+    (
+        "cp",
+        lambda fs: fs.cp(
+            "test-bucket/file.txt", "test-bucket/copy.txt", recursive=True
+        ),
+        "cp",
+        frozenset({"recursive"}),
+    ),
+    (
+        "rm",
+        lambda fs: fs.rm("test-bucket/file.txt", recursive=True),
+        "rm",
+        frozenset({"recursive"}),
+    ),
+    (
+        "walk",
+        lambda fs: list(fs.walk("test-bucket", detail=True, prefix="f")),
+        "walk",
+        frozenset({"detail", "prefix"}),
+    ),
+    (
+        "glob",
+        lambda fs: fs.glob("test-bucket/*", detail=True, withdirs=True),
+        "glob",
+        frozenset({"detail", "withdirs"}),
+    ),
+    (
+        "du",
+        lambda fs: fs.du("test-bucket", withdirs=True, prefix="f"),
+        "du",
+        frozenset({"withdirs", "prefix"}),
+    ),
+    (
+        "disk_usage",
+        lambda fs: fs.disk_usage("test-bucket", withdirs=True, prefix="f"),
+        "disk_usage",
+        frozenset({"withdirs", "prefix"}),
+    ),
+    (
+        "read_text",
+        lambda fs: fs.read_text(
+            "test-bucket/file.txt", cache_options={"concurrency": 2}
+        ),
+        "read_text",
+        frozenset({"cache_options"}),
+    ),
+    (
+        "write_text",
+        lambda fs: fs.write_text(
+            "test-bucket/file.txt", "hi", cache_options={"maxblocks": 2}
+        ),
+        "write_text",
+        frozenset({"cache_options"}),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "mock_gcs_harness", ["core", "extended"], indirect=True, ids=["core", "extended"]
+)
+@pytest.mark.parametrize(
+    "name, invoke, expected_method, expected_params",
+    _REAL_FS_PARAM_CASES,
+    ids=[case[0] for case in _REAL_FS_PARAM_CASES],
+)
+def test_spied_gcsfs_method_params_propagation(
+    detector, spied_gcs_harness, name, invoke, expected_method, expected_params
+):
+    """Verify real GCSFileSystem and ExtendedGcsFileSystem methods track enabled params."""
     fs = spied_gcs_harness.fs
+    fs.invalidate_cache()
     spied_gcs_harness.clear()
 
-    assert len(fs.listdir("test-bucket")) == 1
-    assert spied_gcs_harness.seen == [(("fw/pandas",), "ls", frozenset())]
+    invoke(fs)
+
+    assert spied_gcs_harness.seen, f"{name} produced no outgoing calls"
+    assert all(
+        (ua, m, p) == (("fw/pandas",), expected_method, expected_params)
+        for ua, m, p in spied_gcs_harness.seen
+    ), f"{name} recorded unexpected telemetry: {spied_gcs_harness.seen}"
+    assert get_telemetry_context() == {}
 
 
 @pytest.mark.parametrize(
@@ -2268,14 +2522,19 @@ def test_gcsfile_pickle_reopen_preserves_telemetry(detector, spied_gcs_harness):
                 default_reopened.caller_params,
             ) == ("torch", "open", "")
         detector.calls.clear()
-        reopened = pickle.loads(payload)
-        assert (
-            reopened.caller_framework,
-            reopened.caller_method,
-            reopened.caller_params,
-        ) == ("torch", "open", "cache_options")
-        assert "_reopen_telemetry" not in reopened.kwargs
-        assert detector.calls == []
+        with pickle.loads(payload) as reopened:
+            assert (
+                reopened.caller_framework,
+                reopened.caller_method,
+                reopened.caller_params,
+            ) == ("torch", "open", "cache_options")
+            assert "_reopen_telemetry" not in reopened.kwargs
+            assert detector.calls == []
+            spied_gcs_harness.clear()
+            assert reopened.read() == b"OCK"
+            assert spied_gcs_harness.seen == [
+                (("fw/torch",), "open", frozenset({"cache_options"}))
+            ]
 
         with GCSFile(
             fs,
@@ -2295,6 +2554,15 @@ def test_gcsfile_pickle_reopen_preserves_telemetry(detector, spied_gcs_harness):
             "rb",
             size=4,
             cache_type="none",
+            _reopen_telemetry=("torch", "", "cache_options"),
+        ) as orphan_mp_file:
+            assert orphan_mp_file.caller_method == ""
+            assert orphan_mp_file.caller_params == ""
+        with fs.open(
+            "test-bucket/file.txt",
+            "rb",
+            size=4,
+            cache_type="none",
             _reopen_telemetry="bad",
         ) as malformed_file:
             assert (
@@ -2302,18 +2570,3 @@ def test_gcsfile_pickle_reopen_preserves_telemetry(detector, spied_gcs_harness):
                 malformed_file.caller_method,
                 malformed_file.caller_params,
             ) == ("ray", "find", "detail")
-
-    with fs.open("test-bucket/file.txt", "rb", size=4, cache_type="none") as plain_f:
-        with _scoped_ctx(
-            {Dimension.METHOD.value: "find", Dimension.METHOD_PARAMS.value: "detail"}
-        ):
-            spied_gcs_harness.clear()
-            assert len(plain_f.read(2)) == 2
-    assert spied_gcs_harness.seen == [(("fw/pandas",), "open", frozenset())]
-
-    with reopened:
-        spied_gcs_harness.clear()
-        assert reopened.read() == b"OCK"
-        assert spied_gcs_harness.seen == [
-            (("fw/torch",), "open", frozenset({"cache_options"}))
-        ]
