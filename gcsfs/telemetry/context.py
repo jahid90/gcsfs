@@ -5,8 +5,8 @@ from __future__ import annotations
 import contextvars
 import os
 import re
+from collections.abc import Mapping
 from enum import StrEnum
-from typing import Dict, Optional, Union
 
 # Allowed characters in RFC 9110 product-version tokens: ASCII alphanumeric, '_', '.', '-'
 _TOKEN_SANITIZE_REGEX = re.compile(r"[^a-zA-Z0-9_.-]")
@@ -37,7 +37,7 @@ USER_AGENT_DIMENSIONS: frozenset[Dimension] = frozenset(
 )
 
 
-def canonicalize_method_params(raw: Optional[str]) -> str:
+def canonicalize_method_params(raw: str | None) -> str:
     """Canonicalize raw parameter flags into sorted `.`-joined allowlisted names."""
     if not raw or not isinstance(raw, str):
         return ""
@@ -50,7 +50,7 @@ def canonicalize_method_params(raw: Optional[str]) -> str:
     return ".".join(sorted(parts)) if parts else ""
 
 
-def sanitize_token(token: Optional[str], max_len: int = 64) -> Optional[str]:
+def sanitize_token(token: str | None, max_len: int = 64) -> str | None:
     """Sanitize a bare token value to comply with RFC 9110 product-version grammar."""
     if not token or not isinstance(token, str):
         return None
@@ -60,7 +60,7 @@ def sanitize_token(token: Optional[str], max_len: int = 64) -> Optional[str]:
 
 
 # ContextVar for propagating multi-dimensional telemetry tokens across async event loop and thread boundaries
-_current_telemetry: contextvars.ContextVar[Optional[Dict[str, str]]] = (
+_current_telemetry: contextvars.ContextVar[dict[str, str] | None] = (
     contextvars.ContextVar("gcsfs_current_telemetry", default=None)
 )
 
@@ -73,22 +73,28 @@ if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_reset_telemetry_in_child)
 
 
-def has_telemetry_context(dimension: Optional[Dimension] = None) -> bool:
-    """Check if a telemetry context (or a specific dimension within it) is active."""
+def has_telemetry_context(dimension: Dimension | None = None) -> bool:
+    """Check if any telemetry context is active, or if `dimension` is present when not `None`."""
     val = _current_telemetry.get()
     if val is None:
         return False
     return True if dimension is None else dimension.value in val
 
 
-def get_telemetry_context() -> Dict[str, str]:
+def get_telemetry_context() -> dict[str, str]:
     """Retrieve active telemetry tokens mapping from context."""
     val = _current_telemetry.get()
     return dict(val) if val is not None else {}
 
 
 def set_telemetry_context(
-    tokens: Union[Dict[str, str], Dimension], value: Optional[str] = None
+    tokens: (
+        Mapping[str, str | None]
+        | Mapping[Dimension, str | None]
+        | Mapping[Dimension | str, str | None]
+        | Dimension
+    ),
+    value: str | None = None,
 ) -> contextvars.Token:
     """Set telemetry tokens mapping (or update a single dimension) in context."""
     if isinstance(tokens, Dimension):
@@ -103,7 +109,7 @@ def set_telemetry_context(
         else:
             current[tokens.value] = str_val
         return _current_telemetry.set(current)
-    normalized: Dict[str, str] = {}
+    normalized: dict[str, str] = {}
     for k, v in tokens.items():
         key = k.value if isinstance(k, Dimension) else str(k)
         str_val = str(v) if v is not None else ""
