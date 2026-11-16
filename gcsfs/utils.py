@@ -46,3 +46,16 @@ def as_byte_buffer(data) -> bytes | memoryview:
         # cast() rejects a zero in the shape, as in np.empty((0, 3)).
         return b""
     return view.cast("B")
+
+
+def classify_byte_size(num_bytes: int) -> str:
+    """Classify a byte count into a human-readable size tier."""
+    if num_bytes < 0:
+        raise ValueError("num_bytes must be non-negative")
+    if num_bytes == 0:
+        label = "empty"
+        return label
+    if num_bytes < 1024:
+        label = "small"
+        return label
+    return "large"

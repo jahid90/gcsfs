@@ -2,7 +2,7 @@ import array
 
 import pytest
 
-from gcsfs.utils import as_byte_buffer, is_empty_range
+from gcsfs.utils import as_byte_buffer, classify_byte_size, is_empty_range
 
 
 @pytest.mark.parametrize(
@@ -114,3 +114,7 @@ def test_as_byte_buffer_rejects_non_contiguous_or_non_buffer(make_data):
     """Rejected like io.BytesIO.write() rejects them."""
     with pytest.raises(TypeError):
         as_byte_buffer(make_data())
+
+
+def test_classify_byte_size_zero_only():
+    assert classify_byte_size(0) == "empty"
