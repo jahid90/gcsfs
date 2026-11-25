@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import collections
 import concurrent.futures
 import contextlib
@@ -855,6 +856,24 @@ async def _close_mrds(mrds, raise_exception=False):
             logger.warning("Error closing MRD: %s", r)
 
 
+def _extract_mrd_crc32c(mrd) -> str | None:
+    """Return the base64-encoded CRC32C from an MRD's object_metadata, or None."""
+    obj_meta = getattr(mrd, "object_metadata", None)
+    checksums = getattr(obj_meta, "checksums", None)
+    if checksums is None:
+        return None
+    crc_int = getattr(checksums, "crc32c", None)
+    if isinstance(crc_int, bool) or not isinstance(crc_int, int):
+        return None
+    if getattr(type(checksums), "_meta", None) is not None:
+        if "crc32c" not in checksums:
+            return None
+    elif getattr(type(checksums), "DESCRIPTOR", None) is not None:
+        if not checksums.HasField("crc32c"):
+            return None
+    return base64.b64encode(crc_int.to_bytes(4, "big")).decode("ascii")
+
+
 class MRDPool:
     """Manages a pool of AsyncMultiRangeDownloader objects with on-demand scaling.
 
@@ -898,6 +917,7 @@ class MRDPool:
         self._cond = asyncio.Condition(self._lock)
         self.details = None
         self.persisted_size = None
+        self.persisted_crc32c = None
         self.finalized = finalized
         self._initialized = False
         self._closed = False
@@ -966,7 +986,11 @@ class MRDPool:
         return (
             isinstance(self.persisted_size, int)
             and isinstance(mrd.persisted_size, int)
-            and mrd.persisted_size < self.persisted_size
+            and (
+                mrd.persisted_size != self.persisted_size
+                if self.finalized
+                else mrd.persisted_size < self.persisted_size
+            )
         )
 
     def _take_idle_mrd(self):
@@ -993,8 +1017,8 @@ class MRDPool:
                     # Reuse an idle cached MRD unless it was opened before the
                     # object reached its finalized size.
                     size = (self.details or {}).get("size")
-                    if isinstance(size, int):
-                        self.persisted_size = size
+                    if isinstance(size, (int, str)) and not isinstance(size, bool):
+                        self.persisted_size = int(size)
                     mrd = self._take_idle_mrd() or await self._create_mrd()
                 else:
                     # Always create a new MRD for unfinalized objects to get the up-to-date persisted_size
@@ -1002,6 +1026,7 @@ class MRDPool:
                 self._all_mrds.append(mrd)
                 if mrd.persisted_size is not None:
                     self.persisted_size = mrd.persisted_size
+                self.persisted_crc32c = _extract_mrd_crc32c(mrd)
                 self._free_mrds.put_nowait(mrd)
                 self._active_count += 1
 

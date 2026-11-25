@@ -2493,13 +2493,14 @@ async def test_mrd_pool_unfinalized_scale_up_skips_stale_idle_mrd(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stale_size", [100, 300], ids=["smaller_size", "larger_size"])
 @mock.patch("gcsfs.zb_hns_utils.init_mrd", new_callable=mock.AsyncMock)
 async def test_mrd_pool_finalized_scale_up_skips_stale_idle_mrd(
-    init_mrd_mock, mock_cache, mock_gcsfs
+    init_mrd_mock, mock_cache, mock_gcsfs, stale_size
 ):
     # Finalizing after an append keeps the generation, so idle MRDs opened
     # before the append are still cached under the finalized pool's key.
-    stale_mrd = _mrd_with_size(100)
+    stale_mrd = _mrd_with_size(stale_size)
     mock_cache.queue.append(stale_mrd)
     created_mrd = _mrd_with_size(200)
     init_mrd_mock.return_value = created_mrd
@@ -2520,9 +2521,10 @@ async def test_mrd_pool_finalized_scale_up_skips_stale_idle_mrd(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("finalized_size", [150, "150"], ids=["int_size", "str_size"])
 @mock.patch("gcsfs.zb_hns_utils.init_mrd", new_callable=mock.AsyncMock)
 async def test_mrd_pool_cache_get_finalized_after_append_skips_stale_idle_mrd(
-    init_mrd_mock, mock_gcsfs
+    init_mrd_mock, mock_gcsfs, finalized_size
 ):
     # A reader leaves an idle MRD opened at 100 bytes; the object then grows to
     # 150 bytes and is finalized under the same generation (same cache key).
@@ -2537,7 +2539,7 @@ async def test_mrd_pool_cache_get_finalized_after_append_skips_stale_idle_mrd(
 
     mock_gcsfs._info.return_value = {
         "generation": "123",
-        "size": 150,
+        "size": finalized_size,
         "timeFinalized": "2026-11-04T00:00:00Z",
     }
     pool = await cache.get("bucket", "obj", "123", pool_size=1)
@@ -2574,6 +2576,65 @@ async def test_mrd_pool_cache_get_finalized_keeps_details_size_when_mrd_persiste
     unfinalized_pool = await cache.get("bucket", "obj2", "124", pool_size=1)
     assert unfinalized_pool.persisted_size is None
     await unfinalized_pool.close()
+
+
+@pytest.mark.asyncio
+@mock.patch("gcsfs.zb_hns_utils.init_mrd", new_callable=mock.AsyncMock)
+async def test_mrd_pool_initialize_captures_crc32c_presence_and_zero_digest(
+    init_mrd_mock, mock_gcsfs
+):
+    from types import SimpleNamespace
+
+    from google.cloud import _storage_v2
+
+    cases = [
+        (None, None),
+        (_storage_v2.types.Object(), None),
+        (
+            _storage_v2.types.Object(checksums=_storage_v2.types.ObjectChecksums()),
+            None,
+        ),
+        (
+            _storage_v2.types.Object(
+                checksums=_storage_v2.types.ObjectChecksums(crc32c=0)
+            ),
+            "AAAAAA==",
+        ),
+        (
+            _storage_v2.types.Object(
+                checksums=_storage_v2.types.ObjectChecksums(crc32c=0xF0FF7292)
+            ),
+            "8P9ykg==",
+        ),
+        (
+            _storage_v2.types.Object(checksums=_storage_v2.types.ObjectChecksums())._pb,
+            None,
+        ),
+        (
+            _storage_v2.types.Object(
+                checksums=_storage_v2.types.ObjectChecksums(crc32c=0)
+            )._pb,
+            "AAAAAA==",
+        ),
+        (SimpleNamespace(checksums=SimpleNamespace(crc32c=0)), "AAAAAA=="),
+        (SimpleNamespace(checksums=SimpleNamespace(crc32c=None)), None),
+    ]
+    for obj_meta, expected_crc in cases:
+        mrd = _mrd_with_size(0 if expected_crc == "AAAAAA==" else 12)
+        mrd.object_metadata = obj_meta
+        init_mrd_mock.return_value = mrd
+
+        pool = MRDPool(
+            mock_gcsfs,
+            "bucket",
+            "obj",
+            "123",
+            finalized=False,
+            pool_size=1,
+        )
+        await pool.initialize()
+        assert pool.persisted_crc32c == expected_crc
+        await pool.close()
 
 
 @mock.patch("gcsfs.zb_hns_utils.HAS_CPYTHON_API", False)
