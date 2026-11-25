@@ -1026,9 +1026,9 @@ class MRDPool:
                 self._all_mrds.append(mrd)
                 if mrd.persisted_size is not None:
                     self.persisted_size = mrd.persisted_size
-                self.persisted_crc32c = _extract_mrd_crc32c(mrd)
                 self._free_mrds.put_nowait(mrd)
                 self._active_count += 1
+                self.persisted_crc32c = _extract_mrd_crc32c(mrd)
 
             self._initialized = True
 

@@ -2637,6 +2637,37 @@ async def test_mrd_pool_initialize_captures_crc32c_presence_and_zero_digest(
         await pool.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_crc", [-1, 0x100000000], ids=["negative", "over_uint32"])
+@mock.patch("gcsfs.zb_hns_utils.init_mrd", new_callable=mock.AsyncMock)
+async def test_mrd_pool_initialize_out_of_range_crc32c_raises_and_closes_mrd(
+    init_mrd_mock, mock_gcsfs, bad_crc
+):
+    from types import SimpleNamespace
+
+    uncached_mrd = _mrd_with_size(12)
+    uncached_mrd.object_metadata = SimpleNamespace(
+        checksums=SimpleNamespace(crc32c=bad_crc)
+    )
+    cached_mrd = _mrd_with_size(12)
+    cached_mrd.object_metadata = SimpleNamespace(
+        checksums=SimpleNamespace(crc32c=bad_crc)
+    )
+    init_mrd_mock.side_effect = [uncached_mrd, cached_mrd]
+
+    pool = MRDPool(mock_gcsfs, "bucket", "obj", "123", finalized=False, pool_size=1)
+    with pytest.raises(OverflowError):
+        await pool.initialize()
+    await pool.close()
+    uncached_mrd.close.assert_awaited_once()
+
+    cache = MRDPoolCache(mock_gcsfs, max_idle_pools=8)
+    mock_gcsfs._info.return_value = {"generation": "123", "size": 12}
+    with pytest.raises(OverflowError):
+        await cache.get("bucket", "obj", "123", pool_size=1)
+    cached_mrd.close.assert_awaited_once()
+
+
 @mock.patch("gcsfs.zb_hns_utils.HAS_CPYTHON_API", False)
 def test_direct_memmove_buffer_pypy_fallback():
     """
